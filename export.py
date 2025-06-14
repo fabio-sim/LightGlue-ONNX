@@ -213,13 +213,6 @@ def export_onnx(
         kpts0 = normalize_keypoints(kpts0, image0.shape[1], image0.shape[2])
         kpts1 = normalize_keypoints(kpts1, image1.shape[1], image1.shape[2])
 
-        # transport to CPU
-        # Some operations in Aliked are forced on CUDA device
-        kpts0 = kpts0.to("cpu")
-        kpts1 = kpts1.to("cpu")
-        desc0 = desc0.to("cpu")
-        desc1 = desc1.to("cpu")
-
         torch.onnx.export(
             lightglue,
             (kpts0, kpts1, desc0, desc1),
