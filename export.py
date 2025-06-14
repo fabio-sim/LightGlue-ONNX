@@ -3,9 +3,13 @@ from typing import List
 
 import torch
 
+from lightglue_onnx.aliked.aliked import ALIKED
 from lightglue_onnx import DISK, LightGlue, LightGlueEnd2End, SuperPoint
 from lightglue_onnx.end2end import normalize_keypoints
 from lightglue_onnx.utils import load_image, rgb_to_grayscale
+
+from lightglue_onnx.aliked import deform_conv2d_onnx_exporter
+deform_conv2d_onnx_exporter.register_deform_conv2d_onnx_op()
 
 
 def parse_args() -> argparse.Namespace:
@@ -22,9 +26,16 @@ def parse_args() -> argparse.Namespace:
         "--extractor_type",
         type=str,
         default="superpoint",
-        choices=["superpoint", "disk"],
+        choices=["superpoint", "disk", "aliked"],
         required=False,
         help="Type of feature extractor. Supported extractors are 'superpoint' and 'disk'. Defaults to 'superpoint'.",
+    )
+    parser.add_argument(
+        "--aliked_model",
+        type=str,
+        default=None,
+        required=False,
+        help="The model for aliked extractor.",
     )
     parser.add_argument(
         "--extractor_path",
@@ -64,6 +75,7 @@ def parse_args() -> argparse.Namespace:
 def export_onnx(
     img_size=512,
     extractor_type="superpoint",
+    aliked_model="",
     extractor_path=None,
     lightglue_path=None,
     img0_path="assets/sacre_coeur1.jpg",
@@ -75,6 +87,18 @@ def export_onnx(
     # Handle args
     if isinstance(img_size, List) and len(img_size) == 1:
         img_size = img_size[0]
+
+    # Handle aliked desc dim
+    aliked_desc_dim: dict[str, int] = {
+        "aliked-t16": 64,
+        "aliked-n16": 128,
+        "aliked-n16rot": 128,
+        "aliked-n32": 128,
+    }
+    if extractor_type == "aliked" and aliked_model not in aliked_desc_dim:
+        raise ValueError(
+            "The specified aliked model not found. Choose one from -> "
+            "aliked-t16, aliked-n16, aliked-n16rot, or aliked-n32")
 
     if extractor_path is not None and end2end:
         raise ValueError(
@@ -108,6 +132,15 @@ def export_onnx(
     elif extractor_type == "disk":
         extractor = DISK(max_num_keypoints=max_num_keypoints).eval()
         lightglue = LightGlue(extractor_type).eval()
+    elif extractor_type == "aliked":
+        # image0 = image0.cuda()
+        # image1 = image1.cuda()
+        extractor = ALIKED(
+            model_name=aliked_model,
+            device="cpu",
+            top_k=max_num_keypoints
+        )
+        lightglue = LightGlue(aliked_model).eval()
     else:
         raise NotImplementedError(
             f"LightGlue has not been trained on {extractor_type} features."
