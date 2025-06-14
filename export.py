@@ -97,8 +97,8 @@ def export_onnx(
     }
     if extractor_type == "aliked" and aliked_model not in aliked_desc_dim:
         raise ValueError(
-            "The aliked model not found. Choose one from -> aliked-t16, \
-                    aliked-n16, aliked-n16rot, or aliked-n32")
+            "The specified aliked model not found. Choose one from -> "
+            "aliked-t16, aliked-n16, aliked-n16rot, or aliked-n32")
 
     if extractor_path is not None and end2end:
         raise ValueError(
