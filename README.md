@@ -35,12 +35,32 @@ Open Neural Network Exchange (ONNX) compatible implementation of [LightGlue: Loc
 
 ## ⭐ ONNX Export & Inference
 
-We provide a [typer](https://github.com/tiangolo/typer) CLI [`dynamo.py`](dynamo.py) to easily export LightGlue to ONNX and perform inference using ONNX Runtime. If you would like to try out inference right away, you can download ONNX models that have already been exported [here](https://github.com/fabio-sim/LightGlue-ONNX/releases).
+We provide a [typer](https://github.com/tiangolo/typer) CLI `lightglue-onnx` to easily export LightGlue to ONNX and perform inference using ONNX Runtime. If you would like to try out inference right away, you can download ONNX models that have already been exported [here](https://github.com/fabio-sim/LightGlue-ONNX/releases).
+
+## 📦 Installation (uv)
+
+Inference-only (default):
 
 ```shell
-$ python dynamo.py --help
+uv sync
+```
 
-Usage: dynamo.py [OPTIONS] COMMAND [ARGS]...
+Export support (adds PyTorch + ONNX):
+
+```shell
+uv sync --group export
+```
+
+TensorRT CLI support:
+
+```shell
+uv sync --group trt
+```
+
+```shell
+$ uv run lightglue-onnx --help
+
+Usage: lightglue-onnx [OPTIONS] COMMAND [ARGS]...
 
 LightGlue Dynamo CLI
 
@@ -52,14 +72,17 @@ LightGlue Dynamo CLI
 ╰──────────────────────────────────────────────────╯
 ```
 
-Pass `--help` to see the available options for each command. The CLI will export the full extractor-matcher pipeline so that you don't have to worry about orchestrating intermediate steps.
+Pass `--help` to see the available options for each command. The CLI will export the full extractor-matcher pipeline so that you don't have to worry about orchestrating intermediate steps. By default, inference uses CUDA when available and falls back to CPU if the requested provider cannot be loaded.
+
+### GPU Prerequisites
+The ONNX Runtime CUDA and TensorRT execution providers require compatible CUDA and cuDNN versions for your platform. If you encounter provider loading errors, confirm your CUDA/cuDNN setup against the ONNX Runtime CUDA provider documentation.
 
 ## 📖 Example Commands
 
 <details>
 <summary>🔥 ONNX Export</summary>
 <pre>
-python dynamo.py export superpoint \
+uv run lightglue-onnx export superpoint \
   --num-keypoints 1024 \
   -b 2 -h 1024 -w 1024 \
   -o weights/superpoint_lightglue_pipeline.onnx
@@ -67,9 +90,20 @@ python dynamo.py export superpoint \
 </details>
 
 <details>
+<summary>🧰 Legacy Export Fallback</summary>
+<pre>
+uv run lightglue-onnx export superpoint \
+  --num-keypoints 1024 \
+  -b 2 -h 1024 -w 1024 \
+  --legacy-export \
+  -o weights/superpoint_lightglue_pipeline.onnx
+</pre>
+</details>
+
+<details>
 <summary>⚡ ONNX Runtime Inference (CUDA)</summary>
 <pre>
-python dynamo.py infer \
+uv run lightglue-onnx infer \
   weights/superpoint_lightglue_pipeline.onnx \
   assets/sacre_coeur1.jpg assets/sacre_coeur2.jpg \
   superpoint \
@@ -81,7 +115,7 @@ python dynamo.py infer \
 <details>
 <summary>🚀 ONNX Runtime Inference (TensorRT)</summary>
 <pre>
-python dynamo.py infer \
+uv run lightglue-onnx infer \
   weights/superpoint_lightglue_pipeline.trt.onnx \
   assets/sacre_coeur1.jpg assets/sacre_coeur2.jpg \
   superpoint \
@@ -93,7 +127,7 @@ python dynamo.py infer \
 <details>
 <summary>🧩 TensorRT Inference</summary>
 <pre>
-python dynamo.py trtexec \
+uv run lightglue-onnx trtexec \
   weights/superpoint_lightglue_pipeline.trt.onnx \
   assets/sacre_coeur1.jpg assets/sacre_coeur2.jpg \
   superpoint \
@@ -105,7 +139,7 @@ python dynamo.py trtexec \
 <details>
 <summary>🟣 ONNX Runtime Inference (OpenVINO)</summary>
 <pre>
-python dynamo.py infer \
+uv run lightglue-onnx infer \
   weights/superpoint_lightglue_pipeline.onnx \
   assets/sacre_coeur1.jpg assets/sacre_coeur2.jpg \
   superpoint \

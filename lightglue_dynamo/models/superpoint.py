@@ -48,6 +48,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from lightglue_dynamo.ops.shape_utils import shape_as_tensor
+
 
 def simple_nms(scores: torch.Tensor, nms_radius: int) -> torch.Tensor:
     """Fast Non-maximum suppression to remove nearby points"""
@@ -75,19 +77,19 @@ class SuperPoint(nn.Module):
     """
 
     weights_url = "https://github.com/cvg/LightGlue/releases/download/v0.1_arxiv/superpoint_v1.pth"
+    descriptor_dim: int
+    nms_radius: int
+    remove_borders: int | None
+    num_keypoints: int
 
     def __init__(
-        self,
-        descriptor_dim: int = 256,
-        nms_radius: int = 4,
-        remove_borders: int | None = 4,
-        num_keypoints: int = 1024,
-    ):
+        self, descriptor_dim: int = 256, nms_radius: int = 4, remove_borders: int | None = 4, num_keypoints: int = 1024
+    ) -> None:
         super().__init__()
-        self.descriptor_dim = descriptor_dim
-        self.nms_radius = nms_radius
-        self.remove_borders = remove_borders
-        self.num_keypoints = num_keypoints
+        self.descriptor_dim = descriptor_dim  # type: ignore[unresolved-attribute]
+        self.nms_radius = nms_radius  # type: ignore[unresolved-attribute]
+        self.remove_borders = remove_borders  # type: ignore[unresolved-attribute]
+        self.num_keypoints = num_keypoints  # type: ignore[unresolved-attribute]
 
         if self.remove_borders is not None and self.remove_borders <= 0:
             raise ValueError("remove_borders must be positive or None")
@@ -139,6 +141,9 @@ class SuperPoint(nn.Module):
         scores = self.convPb(cPa)
         scores = F.softmax(scores, 1)[:, :-1]  # 65 -> 64
         b, _, h, w = scores.shape  # C == 64
+        shape = shape_as_tensor(scores).to(device=scores.device)
+        h_i = shape[-2]
+        w_i = shape[-1]
         s = 8  # scale factor (constant)
         scores = (
             scores.reshape(b, s, s, h, w)
@@ -157,15 +162,11 @@ class SuperPoint(nn.Module):
 
         # Select top-K keypoints
         top_scores, top_indices = scores.reshape(b, h * s * w * s).topk(self.num_keypoints)
-        if torch.jit.is_tracing():  # type: ignore
-            one = torch.tensor(1)  # Always constant, safe to ignore warning.
-            top_indices = top_indices.unsqueeze(2).floor_divide(
-                torch.stack([w * s, one]).to(device=top_indices.device)  # type: ignore
-            ) % torch.stack([h * s, w * s]).to(device=top_indices.device)  # type: ignore
-        else:
-            top_indices = top_indices.unsqueeze(2).floor_divide(
-                torch.tensor([w * s, 1], device=top_indices.device)
-            ) % torch.tensor([h * s, w * s], device=top_indices.device)
+        s_i = h_i.new_tensor(s)
+        one = h_i.new_tensor(1)
+        denom = torch.stack([w_i * s_i, one])
+        mod = torch.stack([h_i * s_i, w_i * s_i])
+        top_indices = top_indices.unsqueeze(2).floor_divide(denom) % mod
         top_keypoints = top_indices.flip(2)
 
         # Compute the dense descriptors
@@ -174,12 +175,10 @@ class SuperPoint(nn.Module):
         top_descriptors = F.normalize(top_descriptors, p=2, dim=1)
 
         # Extract descriptors at keypoint locations
-        if torch.jit.is_tracing():  # type: ignore
-            divisor = torch.stack([w, h]) * s - s / 2 - 0.5  # type: ignore
-            divisor = divisor.to(device=top_keypoints.device)
-        else:
-            divisor = torch.tensor([w, h], device=top_keypoints.device) * s - s / 2 - 0.5
-        normalized_keypoints = 2 * (top_keypoints - (s / 2 - 0.5)) / divisor - 1
+        s_f = scores.new_tensor(float(s))
+        divisor = torch.stack([w_i, h_i]).to(device=top_keypoints.device, dtype=scores.dtype)
+        divisor = divisor * s_f - s_f / 2 - 0.5
+        normalized_keypoints = 2 * (top_keypoints.to(dtype=scores.dtype) - (s_f / 2 - 0.5)) / divisor - 1
         top_descriptors = F.grid_sample(
             top_descriptors, normalized_keypoints[:, None], mode="bilinear", align_corners=True
         ).reshape(b, self.descriptor_dim, self.num_keypoints)

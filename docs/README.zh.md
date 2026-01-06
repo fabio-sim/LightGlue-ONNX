@@ -35,12 +35,32 @@
 
 ## ⭐ ONNX 导出与推理
 
-我们提供了一个 [typer](https://github.com/tiangolo/typer) CLI [`dynamo.py`](/dynamo.py)，用于轻松导出 LightGlue 为 ONNX 模型，并使用 ONNX Runtime 进行推理。如果你希望立即尝试推理，可以从[此处](https://github.com/fabio-sim/LightGlue-ONNX/releases)下载已导出的 ONNX 模型。
+我们提供了一个 [typer](https://github.com/tiangolo/typer) CLI `lightglue-onnx`，用于轻松导出 LightGlue 为 ONNX 模型，并使用 ONNX Runtime 进行推理。如果你希望立即尝试推理，可以从[此处](https://github.com/fabio-sim/LightGlue-ONNX/releases)下载已导出的 ONNX 模型。
+
+## 📦 安装（uv）
+
+仅推理（默认）：
 
 ```shell
-$ python dynamo.py --help
+uv sync
+```
 
-Usage: dynamo.py [OPTIONS] COMMAND [ARGS]...
+导出支持（包含 PyTorch + ONNX）：
+
+```shell
+uv sync --group export
+```
+
+TensorRT CLI 支持：
+
+```shell
+uv sync --group trt
+```
+
+```shell
+$ uv run lightglue-onnx --help
+
+Usage: lightglue-onnx [OPTIONS] COMMAND [ARGS]...
 
 LightGlue Dynamo CLI
 
@@ -58,7 +78,7 @@ LightGlue Dynamo CLI
 <details>
 <summary>🔥 ONNX 导出</summary>
 <pre>
-python dynamo.py export superpoint \
+uv run lightglue-onnx export superpoint \
   --num-keypoints 1024 \
   -b 2 -h 1024 -w 1024 \
   -o weights/superpoint_lightglue_pipeline.onnx
@@ -68,7 +88,7 @@ python dynamo.py export superpoint \
 <details>
 <summary>⚡ ONNX Runtime 推理 (CUDA)</summary>
 <pre>
-python dynamo.py infer \
+uv run lightglue-onnx infer \
   weights/superpoint_lightglue_pipeline.onnx \
   assets/sacre_coeur1.jpg assets/sacre_coeur2.jpg \
   superpoint \
@@ -80,7 +100,7 @@ python dynamo.py infer \
 <details>
 <summary>🚀 ONNX Runtime 推理 (TensorRT)</summary>
 <pre>
-python dynamo.py infer \
+uv run lightglue-onnx infer \
   weights/superpoint_lightglue_pipeline.trt.onnx \
   assets/sacre_coeur1.jpg assets/sacre_coeur2.jpg \
   superpoint \
@@ -92,7 +112,7 @@ python dynamo.py infer \
 <details>
 <summary>🧩 TensorRT 推理</summary>
 <pre>
-python dynamo.py trtexec \
+uv run lightglue-onnx trtexec \
   weights/superpoint_lightglue_pipeline.trt.onnx \
   assets/sacre_coeur1.jpg assets/sacre_coeur2.jpg \
   superpoint \
@@ -104,7 +124,7 @@ python dynamo.py trtexec \
 <details>
 <summary>🟣 ONNX Runtime 推理 (OpenVINO)</summary>
 <pre>
-python dynamo.py infer \
+uv run lightglue-onnx infer \
   weights/superpoint_lightglue_pipeline.onnx \
   assets/sacre_coeur1.jpg assets/sacre_coeur2.jpg \
   superpoint \

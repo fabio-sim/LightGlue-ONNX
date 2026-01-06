@@ -9,12 +9,15 @@ torch.backends.cudnn.deterministic = True
 
 
 class LearnableFourierPositionalEncoding(nn.Module):
+    num_heads: int
+    gamma: float
+
     def __init__(self, M: int, descriptor_dim: int, num_heads: int, gamma: float = 1.0) -> None:
         super().__init__()
-        self.num_heads = num_heads
+        self.num_heads = num_heads  # type: ignore[unresolved-attribute]
         head_dim = descriptor_dim // num_heads
         self.Wr = nn.Linear(M, head_dim // 2, bias=False)
-        self.gamma = gamma
+        self.gamma = gamma  # type: ignore[unresolved-attribute]
         nn.init.normal_(self.Wr.weight.data, mean=0, std=self.gamma**-2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -30,20 +33,21 @@ class TokenConfidence(nn.Module):
         super().__init__()
         self.token = nn.Sequential(nn.Linear(dim, 1), nn.Sigmoid())
 
-    def forward(self, desc0: torch.Tensor, desc1: torch.Tensor):
+    def forward(self, desc0: torch.Tensor, desc1: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """get confidence tokens"""
-        return (
-            self.token(desc0.detach()).squeeze(-1),
-            self.token(desc1.detach()).squeeze(-1),
-        )
+        return (self.token(desc0.detach()).squeeze(-1), self.token(desc1.detach()).squeeze(-1))
 
 
 class SelfBlock(nn.Module):
+    embed_dim: int
+    num_heads: int
+    head_dim: int
+
     def __init__(self, embed_dim: int, num_heads: int, bias: bool = True) -> None:
         super().__init__()
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
+        self.embed_dim = embed_dim  # type: ignore[unresolved-attribute]
+        self.num_heads = num_heads  # type: ignore[unresolved-attribute]
+        self.head_dim = embed_dim // num_heads  # type: ignore[unresolved-attribute]
         self.Wqkv = nn.Linear(embed_dim, 3 * embed_dim, bias=bias)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.ffn = nn.Sequential(
@@ -76,11 +80,15 @@ class SelfBlock(nn.Module):
 
 
 class CrossBlock(nn.Module):
+    embed_dim: int
+    num_heads: int
+    head_dim: int
+
     def __init__(self, embed_dim: int, num_heads: int, bias: bool = True) -> None:
         super().__init__()
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.head_dim = embed_dim // num_heads
+        self.embed_dim = embed_dim  # type: ignore[unresolved-attribute]
+        self.num_heads = num_heads  # type: ignore[unresolved-attribute]
+        self.head_dim = embed_dim // num_heads  # type: ignore[unresolved-attribute]
         self.to_qk = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.to_v = nn.Linear(embed_dim, embed_dim, bias=bias)
         self.to_out = nn.Linear(embed_dim, embed_dim, bias=bias)
@@ -104,7 +112,7 @@ class CrossBlock(nn.Module):
 
 
 class TransformerLayer(nn.Module):
-    def __init__(self, embed_dim: int, num_heads: int):
+    def __init__(self, embed_dim: int, num_heads: int) -> None:
         super().__init__()
         self.self_attn = SelfBlock(embed_dim, num_heads)
         self.cross_attn = CrossBlock(embed_dim, num_heads)
@@ -138,11 +146,11 @@ class MatchAssignment(nn.Module):
         scores = sigmoid_log_double_softmax(similarities, z)
         return scores
 
-    def get_matchability(self, desc: torch.Tensor):
+    def get_matchability(self, desc: torch.Tensor) -> torch.Tensor:
         return torch.sigmoid(self.matchability(desc)).squeeze(-1)
 
 
-def filter_matches(scores: torch.Tensor, threshold: float):
+def filter_matches(scores: torch.Tensor, threshold: float) -> tuple[torch.Tensor, torch.Tensor]:
     """obtain matches from a log assignment matrix [BxNxN]"""
     max0 = torch.topk(scores, k=1, dim=2, sorted=False)  # scores.max(2)
     max1 = torch.topk(scores, k=1, dim=1, sorted=False)  # scores.max(1)
@@ -161,6 +169,14 @@ def filter_matches(scores: torch.Tensor, threshold: float):
 
 
 class LightGlue(nn.Module):
+    descriptor_dim: int
+    num_heads: int
+    n_layers: int
+    filter_threshold: float
+    depth_confidence: float
+    width_confidence: float
+    confidence_thresholds: torch.Tensor
+
     def __init__(
         self,
         url: str,
@@ -174,12 +190,12 @@ class LightGlue(nn.Module):
     ) -> None:
         super().__init__()
 
-        self.descriptor_dim = descriptor_dim
-        self.num_heads = num_heads
-        self.n_layers = n_layers
-        self.filter_threshold = filter_threshold
-        self.depth_confidence = depth_confidence
-        self.width_confidence = width_confidence
+        self.descriptor_dim = descriptor_dim  # type: ignore[unresolved-attribute]
+        self.num_heads = num_heads  # type: ignore[unresolved-attribute]
+        self.n_layers = n_layers  # type: ignore[unresolved-attribute]
+        self.filter_threshold = filter_threshold  # type: ignore[unresolved-attribute]
+        self.depth_confidence = depth_confidence  # type: ignore[unresolved-attribute]
+        self.width_confidence = width_confidence  # type: ignore[unresolved-attribute]
 
         if input_dim != self.descriptor_dim:
             self.input_proj = nn.Linear(input_dim, self.descriptor_dim, bias=True)
@@ -195,10 +211,7 @@ class LightGlue(nn.Module):
         self.log_assignment = nn.ModuleList([MatchAssignment(d) for _ in range(n)])
 
         self.token_confidence = nn.ModuleList([TokenConfidence(d) for _ in range(n - 1)])
-        self.register_buffer(
-            "confidence_thresholds",
-            torch.Tensor([self.confidence_threshold(i) for i in range(n)]),
-        )
+        self.register_buffer("confidence_thresholds", torch.Tensor([self.confidence_threshold(i) for i in range(n)]))
 
         state_dict = torch.hub.load_state_dict_from_url(url)
 
@@ -214,7 +227,7 @@ class LightGlue(nn.Module):
         self,
         keypoints: torch.Tensor,  # (2B, N, 2), normalized
         descriptors: torch.Tensor,  # (2B, N, D)
-    ):
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         descriptors = self.input_proj(descriptors)
 
         # positional embeddings
@@ -235,10 +248,7 @@ class LightGlue(nn.Module):
         return np.clip(threshold, 0, 1)
 
     def get_pruning_mask(
-        self,
-        confidences: torch.Tensor | None,
-        scores: torch.Tensor,
-        layer_index: int,
+        self, confidences: torch.Tensor | None, scores: torch.Tensor, layer_index: int
     ) -> torch.Tensor:
         """mask points which should be removed"""
         keep = scores > (1 - self.width_confidence)
@@ -247,11 +257,7 @@ class LightGlue(nn.Module):
         return keep
 
     def check_if_stop(
-        self,
-        confidences0: torch.Tensor,
-        confidences1: torch.Tensor,
-        layer_index: int,
-        num_points: int,
+        self, confidences0: torch.Tensor, confidences1: torch.Tensor, layer_index: int, num_points: int
     ) -> torch.Tensor:
         """evaluate stopping condition"""
         confidences = torch.cat([confidences0, confidences1], -1)
