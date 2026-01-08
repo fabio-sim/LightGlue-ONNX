@@ -32,9 +32,12 @@ class Conv(nn.Sequential):
 
 
 class ThinUnetDownBlock(nn.Sequential):
+    in_: int
+    out_: int
+
     def __init__(self, in_: int, out_: int, size: int = 5, is_first: bool = False) -> None:
-        self.in_ = in_
-        self.out_ = out_
+        self.in_ = in_  # type: ignore[unresolved-attribute]
+        self.out_ = out_  # type: ignore[unresolved-attribute]
 
         downsample: nn.Module
         if is_first:
@@ -48,13 +51,18 @@ class ThinUnetDownBlock(nn.Sequential):
 
 
 class ThinUnetUpBlock(nn.Module):
+    bottom_: int
+    horizontal_: int
+    cat_: int
+    out_: int
+
     def __init__(self, bottom_: int, horizontal_: int, out_: int, size: int = 5) -> None:
         super().__init__()
 
-        self.bottom_ = bottom_
-        self.horizontal_ = horizontal_
-        self.cat_ = bottom_ + horizontal_
-        self.out_ = out_
+        self.bottom_ = bottom_  # type: ignore[unresolved-attribute]
+        self.horizontal_ = horizontal_  # type: ignore[unresolved-attribute]
+        self.cat_ = bottom_ + horizontal_  # type: ignore[unresolved-attribute]
+        self.out_ = out_  # type: ignore[unresolved-attribute]
 
         self.upsample = TrivialUpsample()
         self.conv = Conv(self.cat_, self.out_, size)

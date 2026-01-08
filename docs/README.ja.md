@@ -19,6 +19,7 @@
 <details>
 <summary>更新履歴</summary>
 
+- **2026年1月9日**: モダンな uv で CLI UX を刷新し、`lightglue-onnx` のワークフローを整理、非推奨スタックを削除しつつ依存関係と TensorRT/形状推論の案内を更新。
 - **2024年7月17日**: エンドツーエンドの並列動的バッチサイズのサポート。スクリプト UX の改良。 [ブログ記事](https://fabio-sim.github.io/blog/accelerating-lightglue-inference-onnx-runtime-tensorrt/) を追加。
 - **2023年11月2日**: 約30%のスピードアップのために ArgMax を最適化する TopK トリックを導入。
 - **2023年10月4日**: FlashAttention-2 をサポートする `onnxruntime>=1.16.0` を使用した LightGlue ONNX モデルの統合。長いシーケンス長（キーポイントの数）で最大80%の推論速度向上。
@@ -34,12 +35,32 @@
 
 ## ⭐ ONNX エクスポート & 推論
 
-LightGlue を簡単に ONNX へエクスポートし、ONNX Runtime で推論を行うための [typer](https://github.com/tiangolo/typer) CLI [`dynamo.py`](/dynamo.py) を提供しています。すぐに推論を試したい場合は、[こちら](https://github.com/fabio-sim/LightGlue-ONNX/releases) からすでにエクスポートされた ONNX モデルをダウンロードできます。
+LightGlue を簡単に ONNX へエクスポートし、ONNX Runtime で推論を行うための [typer](https://github.com/tiangolo/typer) CLI `lightglue-onnx` を提供しています。すぐに推論を試したい場合は、[こちら](https://github.com/fabio-sim/LightGlue-ONNX/releases) からすでにエクスポートされた ONNX モデルをダウンロードできます。
+
+## 📦 インストール（uv）
+
+推論のみ（デフォルト）：
 
 ```shell
-$ python dynamo.py --help
+uv sync
+```
 
-Usage: dynamo.py [OPTIONS] COMMAND [ARGS]...
+エクスポート対応（PyTorch + ONNX を追加）：
+
+```shell
+uv sync --group export
+```
+
+TensorRT CLI 対応：
+
+```shell
+uv sync --group trt
+```
+
+```shell
+$ uv run lightglue-onnx --help
+
+Usage: lightglue-onnx [OPTIONS] COMMAND [ARGS]...
 
 LightGlue Dynamo CLI
 
@@ -53,12 +74,19 @@ LightGlue Dynamo CLI
 
 各コマンドのオプションを確認するには、`--help` を使用してください。CLI は完全なエクストラクタ-マッチャー パイプラインをエクスポートするため、中間ステップの調整に悩む必要はありません。
 
+### GPU 前提条件
+ONNX Runtime の CUDA/TensorRT 実行プロバイダーは、対応する CUDA/cuDNN が必要です。PyPI で CUDA/TensorRT ランタイム（例: `onnxruntime-gpu[cuda,cudnn]`, `tensorrt`）をインストールした場合、Polygraphy/TRT EP が `libcudart.so` と `libnvinfer.so` を見つけられるように `LD_LIBRARY_PATH` に venv のパスを追加してください:
+
+```shell
+export LD_LIBRARY_PATH="$PWD/.venv/lib/python3.12/site-packages/tensorrt_libs:$PWD/.venv/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:${LD_LIBRARY_PATH:-}"
+```
+
 ## 📖 使用例コマンド
 
 <details>
 <summary>🔥 ONNX エクスポート</summary>
 <pre>
-python dynamo.py export superpoint \
+uv run lightglue-onnx export superpoint \
   --num-keypoints 1024 \
   -b 2 -h 1024 -w 1024 \
   -o weights/superpoint_lightglue_pipeline.onnx
@@ -68,7 +96,7 @@ python dynamo.py export superpoint \
 <details>
 <summary>⚡ ONNX Runtime 推論 (CUDA)</summary>
 <pre>
-python dynamo.py infer \
+uv run lightglue-onnx infer \
   weights/superpoint_lightglue_pipeline.onnx \
   assets/sacre_coeur1.jpg assets/sacre_coeur2.jpg \
   superpoint \
@@ -80,7 +108,7 @@ python dynamo.py infer \
 <details>
 <summary>🚀 ONNX Runtime 推論 (TensorRT)</summary>
 <pre>
-python dynamo.py infer \
+uv run lightglue-onnx infer \
   weights/superpoint_lightglue_pipeline.trt.onnx \
   assets/sacre_coeur1.jpg assets/sacre_coeur2.jpg \
   superpoint \
@@ -92,7 +120,7 @@ python dynamo.py infer \
 <details>
 <summary>🧩 TensorRT 推論</summary>
 <pre>
-python dynamo.py trtexec \
+uv run lightglue-onnx trtexec \
   weights/superpoint_lightglue_pipeline.trt.onnx \
   assets/sacre_coeur1.jpg assets/sacre_coeur2.jpg \
   superpoint \
@@ -104,7 +132,7 @@ python dynamo.py trtexec \
 <details>
 <summary>🟣 ONNX Runtime 推論 (OpenVINO)</summary>
 <pre>
-python dynamo.py infer \
+uv run lightglue-onnx infer \
   weights/superpoint_lightglue_pipeline.onnx \
   assets/sacre_coeur1.jpg assets/sacre_coeur2.jpg \
   superpoint \

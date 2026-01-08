@@ -1,54 +1,97 @@
-[tool.poetry]
+[project]
 name = "lightglue-onnx"
-version = "2.0.0"
+version = "2.1.0"
 description = "ONNX-compatible LightGlue: Local Feature Matching at Light Speed. Supports TensorRT, TorchDynamo"
-authors = ["Fabio Milentiansen Sim <fabio.milentiansen.sim@gmail.com>"]
-license = "Apache-2.0"
 readme = "README.md"
+requires-python = ">=3.12,<4.0"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Fabio Milentiansen Sim", email = "fabio.milentiansen.sim@gmail.com" }]
+dependencies = [
+    "matplotlib==3.10.8",
+    "numpy==2.2.6",
+    "nvidia-cublas-cu12==12.8.4.1; platform_system != \"Darwin\"",
+    "onnxruntime-gpu[cuda,cudnn]==1.23.2",
+    "opencv-python==4.12.0.88",
+    "typer==0.21.0",
+]
 
-[tool.poetry.dependencies]
-python = "^3.11"
-matplotlib = "^3.9.1"
-opencv-python = "^4.10.0.84"
-typer = "^0.12.3"
-onnxruntime-gpu = {version = "^1.18.1", source = "onnxruntime-gpu-src"}
+[project.scripts]
+lightglue-onnx = "lightglue_dynamo.cli:main"
 
-[tool.poetry.group.export.dependencies]
-onnx = "^1.16.1"
-onnxscript = "^0.1.0.dev20240708"
+[dependency-groups]
+export = [
+    "onnxscript==0.5.7",
+    "onnx==1.20.0",
+    "torch==2.9.1",
+    "torchaudio==2.9.1",
+    "torchvision==0.24.1",
+]
+trt = [
+    "polygraphy==0.49.26",
+    "tensorrt==10.9.0.34",
+]
+test = [
+    "pytest==8.4.2",
+    "pytest-xdist==3.8.0",
+]
 
-[[tool.poetry.source]]
-name = "onnxruntime-gpu-src"
-url = "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple"
-priority = "explicit"
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchvision = [
+  { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchaudio = [
+  { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.build-backend]
+module-name = "lightglue_dynamo"
+module-root = ""
 
 [build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+requires = ["uv_build>=0.9.13,<0.10.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+addopts = """
+-n auto
+"""
 
 [tool.ruff]
-target-version = "py311"
 line-length = 120
+target-version = "py312"
 
 [tool.ruff.lint]
 select = [
-    "F",  # pyflakes
-    "E",  # pycodestyle errors
-    "W",  # pycodestyle warnings
-    "I",  # isort
-    "B",  # flake8-bugbear
-    "A",  # flake8-builtins
-    "C4",  # flake8-comprehensions
-    "UP",  # pyupgrade
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # Pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "C4",   # flake8-comprehensions
     "SIM",  # flake8-simplify
-    "PLC",  # pylint
-    "PLE",  # pylint
-    "PLW",  # pylint
-    "NPY",  # numpy
+    "ANN",  # flake8-annotations
+    "UP",   # pyupgrade
     "RUF",  # ruff
-    "PERF",  # perflint
+    "FURB", # refurb
 ]
 ignore = [
-    "E501",  # line too long, handled by black
-    "W191",  # indentation contains tabs
+    "E501",  # line too long (handled by formatter)
+    "E731",  # do not assign a lambda expression, use a def
 ]
+
+[tool.ruff.lint.isort]
+split-on-trailing-comma = false
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+
+[tool.ruff.format]
+skip-magic-trailing-comma = true
