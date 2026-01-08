@@ -73,6 +73,13 @@ LightGlue Dynamo CLI
 
 使用 `--help` 参数可以查看每个命令的可用选项。CLI 将导出完整的提取器-匹配器管道，因此你不必担心中间步骤的协调。
 
+### GPU 前提条件
+ONNX Runtime 的 CUDA/TensorRT 执行提供程序需要兼容的 CUDA/cuDNN。如果你通过 PyPI 安装 CUDA/TensorRT 运行时（例如 `onnxruntime-gpu[cuda,cudnn]`、`tensorrt`），可能需要把 venv 里的路径加入 `LD_LIBRARY_PATH`，确保 Polygraphy/TRT EP 能找到 `libcudart.so` 和 `libnvinfer.so`：
+
+```shell
+export LD_LIBRARY_PATH="$PWD/.venv/lib/python3.12/site-packages/tensorrt_libs:$PWD/.venv/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:${LD_LIBRARY_PATH:-}"
+```
+
 ## 📖 示例命令
 
 <details>

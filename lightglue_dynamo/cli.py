@@ -153,7 +153,12 @@ def export(
         inferred = SymbolicShapeInference.infer_shapes(onnx.load_model(output), auto_merge=True)  # type: ignore
         onnx.save_model(inferred, output)
     except Exception as exc:
-        typer.echo(f"Warning: Symbolic shape inference failed ({exc}). Skipping.")
+        typer.echo(f"Warning: Symbolic shape inference failed ({exc}). Falling back to onnx.shape_inference.")
+        try:
+            inferred = onnx.shape_inference.infer_shapes(onnx.load_model(output))
+            onnx.save_model(inferred, output)
+        except Exception as fallback_exc:
+            typer.echo(f"Warning: onnx.shape_inference failed ({fallback_exc}). Skipping.")
     typer.echo(f"Successfully exported model to {output}")
     if fp16:
         typer.echo(
@@ -323,6 +328,8 @@ def trtexec(
     profile: Annotated[bool, typer.Option("--profile", help="Whether to profile model execution.")] = False,
 ) -> None:
     """Run pure TensorRT inference for LightGlue model using Polygraphy (requires TensorRT to be installed)."""
+    import site
+
     import numpy as np
     from polygraphy.backend.common import BytesFromPath
     from polygraphy.backend.trt import (
@@ -359,13 +366,38 @@ def trtexec(
         build_engine = EngineFromNetwork(NetworkFromOnnxPath(str(model_path)), config=CreateConfig(fp16=fp16))
         build_engine = SaveEngine(build_engine, str(model_path.with_suffix(".engine")))
 
-    with TrtRunner(build_engine) as runner:
-        for _ in range(10 if profile else 1):  # Warm-up if profiling
-            outputs = runner.infer(feed_dict={"images": images})
-            keypoints, matches, mscores = outputs["keypoints"], outputs["matches"], outputs["mscores"]  # noqa: F841
+    def _print_cuda_runtime_hint() -> None:
+        site_paths = [path for path in [*site.getsitepackages(), site.getusersitepackages()] if path]
+        candidates: list[Path] = []
+        for path in site_paths:
+            base = Path(path)
+            trt_libs = base / "tensorrt_libs"
+            cuda_runtime = base / "nvidia" / "cuda_runtime" / "lib"
+            if trt_libs.exists():
+                candidates.append(trt_libs)
+            if cuda_runtime.exists():
+                candidates.append(cuda_runtime)
+        if candidates:
+            joined = ":".join(str(path) for path in candidates)
+            typer.echo("Hint: add TensorRT + CUDA runtime libs to LD_LIBRARY_PATH, e.g.:")
+            typer.echo(f'export LD_LIBRARY_PATH="{joined}:${{LD_LIBRARY_PATH:-}}"')
+        else:
+            typer.echo(
+                "Hint: ensure TensorRT and CUDA runtime libraries (libnvinfer.so, libcudart.so) are on LD_LIBRARY_PATH."
+            )
 
-        if profile:
-            typer.echo(f"Inference Time: {runner.last_inference_time():.3f} s")
+    try:
+        with TrtRunner(build_engine) as runner:
+            for _ in range(10 if profile else 1):  # Warm-up if profiling
+                outputs = runner.infer(feed_dict={"images": images})
+                keypoints, matches, mscores = outputs["keypoints"], outputs["matches"], outputs["mscores"]  # noqa: F841
+
+            if profile:
+                typer.echo(f"Inference Time: {runner.last_inference_time():.3f} s")
+    except OSError as exc:
+        if "libcudart" in str(exc):
+            _print_cuda_runtime_hint()
+        raise
 
     viz.plot_images(raw_images)
     viz.plot_matches(keypoints[0][matches[..., 1]], keypoints[1][matches[..., 2]], color="lime", lw=0.2)

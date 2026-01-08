@@ -73,6 +73,13 @@ LightGlue Dynamo CLI
 
 各コマンドのオプションを確認するには、`--help` を使用してください。CLI は完全なエクストラクタ-マッチャー パイプラインをエクスポートするため、中間ステップの調整に悩む必要はありません。
 
+### GPU 前提条件
+ONNX Runtime の CUDA/TensorRT 実行プロバイダーは、対応する CUDA/cuDNN が必要です。PyPI で CUDA/TensorRT ランタイム（例: `onnxruntime-gpu[cuda,cudnn]`, `tensorrt`）をインストールした場合、Polygraphy/TRT EP が `libcudart.so` と `libnvinfer.so` を見つけられるように `LD_LIBRARY_PATH` に venv のパスを追加してください:
+
+```shell
+export LD_LIBRARY_PATH="$PWD/.venv/lib/python3.12/site-packages/tensorrt_libs:$PWD/.venv/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:${LD_LIBRARY_PATH:-}"
+```
+
 ## 📖 使用例コマンド
 
 <details>

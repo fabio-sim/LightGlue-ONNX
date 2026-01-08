@@ -76,6 +76,11 @@ Pass `--help` to see the available options for each command. The CLI will export
 
 ### GPU Prerequisites
 The ONNX Runtime CUDA and TensorRT execution providers require compatible CUDA and cuDNN versions for your platform. If you encounter provider loading errors, confirm your CUDA/cuDNN setup against the ONNX Runtime CUDA provider documentation.
+If you install CUDA/TensorRT runtime libraries via PyPI (e.g. `onnxruntime-gpu[cuda,cudnn]` and `tensorrt`), you may need to add the venv paths to `LD_LIBRARY_PATH` so Polygraphy and the TensorRT EP can find `libcudart.so` and `libnvinfer.so`:
+
+```shell
+export LD_LIBRARY_PATH="$PWD/.venv/lib/python3.12/site-packages/tensorrt_libs:$PWD/.venv/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:${LD_LIBRARY_PATH:-}"
+```
 
 ## 📖 Example Commands
 

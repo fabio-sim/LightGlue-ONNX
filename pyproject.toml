@@ -1,6 +1,6 @@
 [project]
 name = "lightglue-onnx"
-version = "2.0.0"
+version = "2.1.0"
 description = "ONNX-compatible LightGlue: Local Feature Matching at Light Speed. Supports TensorRT, TorchDynamo"
 readme = "README.md"
 requires-python = ">=3.12,<4.0"
@@ -28,6 +28,7 @@ export = [
 ]
 trt = [
     "polygraphy==0.49.26",
+    "tensorrt==10.9.0.34",
 ]
 test = [
     "pytest==8.4.2",
