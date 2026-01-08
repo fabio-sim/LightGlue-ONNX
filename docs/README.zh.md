@@ -19,6 +19,7 @@
 <details>
 <summary>更新日志</summary>
 
+- **2026年1月9日**：用现代化 uv 刷新 CLI 体验，统一 `lightglue-onnx` 工作流，清理过时栈，同时更新依赖并补充 TensorRT/形状推断指引。
 - **2024年7月17日**：支持端到端并行动态批量大小。重构脚本用户体验。添加[博客文章](https://fabio-sim.github.io/blog/accelerating-lightglue-inference-onnx-runtime-tensorrt/)。
 - **2023年11月2日**：引入 TopK-trick 来优化 ArgMax，提升约 30% 的速度。
 - **2023年10月4日**：通过 `onnxruntime>=1.16.0` 支持 FlashAttention-2 的 LightGlue ONNX 模型融合，长序列推理速度提升高达 80%。

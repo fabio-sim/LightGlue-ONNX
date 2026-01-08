@@ -19,6 +19,7 @@ Open Neural Network Exchange (ONNX) compatible implementation of [LightGlue: Loc
 <details>
 <summary>Changelog</summary>
 
+- **09 January 2026**: Refurbish the CLI UX with modern uv, streamline the `lightglue-onnx` workflow, and remove deprecated stacks while refreshing dependencies and TensorRT/shape-inference guidance.
 - **17 July 2024**: End-to-end parallel dynamic batch size support. Revamp script UX. Add [blog post](https://fabio-sim.github.io/blog/accelerating-lightglue-inference-onnx-runtime-tensorrt/).
 - **02 November 2023**: Introduce TopK-trick to optimize out ArgMax for about 30% speedup.
 - **04 October 2023:** Fused LightGlue ONNX Models with support for FlashAttention-2 via `onnxruntime>=1.16.0`, up to 80% faster inference on long sequence lengths (number of keypoints).

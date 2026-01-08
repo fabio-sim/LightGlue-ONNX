@@ -19,6 +19,7 @@
 <details>
 <summary>更新履歴</summary>
 
+- **2026年1月9日**: モダンな uv で CLI UX を刷新し、`lightglue-onnx` のワークフローを整理、非推奨スタックを削除しつつ依存関係と TensorRT/形状推論の案内を更新。
 - **2024年7月17日**: エンドツーエンドの並列動的バッチサイズのサポート。スクリプト UX の改良。 [ブログ記事](https://fabio-sim.github.io/blog/accelerating-lightglue-inference-onnx-runtime-tensorrt/) を追加。
 - **2023年11月2日**: 約30%のスピードアップのために ArgMax を最適化する TopK トリックを導入。
 - **2023年10月4日**: FlashAttention-2 をサポートする `onnxruntime>=1.16.0` を使用した LightGlue ONNX モデルの統合。長いシーケンス長（キーポイントの数）で最大80%の推論速度向上。
