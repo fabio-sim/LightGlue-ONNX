@@ -179,14 +179,9 @@ def infer(
     extractor_type: Annotated[Extractor, typer.Argument()] = Extractor.superpoint,
     output_path: Annotated[
         Path | None,
-        typer.Option(
-            "-o",
-            "--output",
-            dir_okay=False,
-            writable=True,
-            help="Path to save output matches figure. If not given, show visualization.",
-        ),
+        typer.Option("-o", "--output", dir_okay=False, writable=True, help="Path to save output matches figure."),
     ] = None,
+    show: Annotated[bool, typer.Option("--show/--no-show", help="Show the match visualization window.")] = False,
     height: Annotated[
         int, typer.Option("-h", "--height", min=1, help="Height of input image at which to perform inference.")
     ] = 1024,
@@ -200,6 +195,8 @@ def infer(
     profile: Annotated[bool, typer.Option("--profile", help="Whether to profile model execution.")] = False,
 ) -> None:
     """Run inference for LightGlue ONNX model."""
+    import time
+
     import numpy as np
     import onnxruntime as ort
 
@@ -283,16 +280,27 @@ def infer(
         if isinstance(width_dim, int) and width_dim != width:
             raise typer.BadParameter(f"Model expects width={width_dim} but got {width}.")
 
+    last_inference_time: float | None = None
     for _ in range(100 if profile else 1):
+        if profile:
+            start = time.perf_counter()
         outputs = cast(list[np.ndarray], session.run(None, {"images": images}))
+        if profile:
+            last_inference_time = time.perf_counter() - start
         keypoints, matches, _mscores = outputs[0], outputs[1], outputs[2]
 
-    viz.plot_images(raw_images)
-    viz.plot_matches(keypoints[0][matches[..., 1]], keypoints[1][matches[..., 2]], color="lime", lw=0.2)
-    if output_path is None:
-        viz.plt.show()
-    else:
-        viz.save_plot(output_path)
+    match_count = int(matches.shape[0])
+    typer.echo(f"Matches: {match_count}")
+    if profile and last_inference_time is not None:
+        typer.echo(f"Inference Time: {last_inference_time:.6f} s")
+
+    if output_path is not None or show:
+        viz.plot_images(raw_images)
+        viz.plot_matches(keypoints[0][matches[..., 1]], keypoints[1][matches[..., 2]], color="lime", lw=0.2)
+        if output_path is not None:
+            viz.save_plot(output_path)
+        if show:
+            viz.plt.show()
 
 
 @app.command()
@@ -310,21 +318,26 @@ def trtexec(
     extractor_type: Annotated[Extractor, typer.Argument()] = Extractor.superpoint,
     output_path: Annotated[
         Path | None,
-        typer.Option(
-            "-o",
-            "--output",
-            dir_okay=False,
-            writable=True,
-            help="Path to save output matches figure. If not given, show visualization.",
-        ),
+        typer.Option("-o", "--output", dir_okay=False, writable=True, help="Path to save output matches figure."),
     ] = None,
+    show: Annotated[bool, typer.Option("--show/--no-show", help="Show the match visualization window.")] = False,
     height: Annotated[
         int, typer.Option("-h", "--height", min=1, help="Height of input image at which to perform inference.")
     ] = 1024,
     width: Annotated[
         int, typer.Option("-w", "--width", min=1, help="Width of input image at which to perform inference.")
     ] = 1024,
+    strongly_typed: Annotated[
+        bool,
+        typer.Option(
+            "--strongly-typed/--no-strongly-typed",
+            help="Enable TensorRT strongly typed network (recommended for FP8 Q/DQ models).",
+        ),
+    ] = False,
     fp16: Annotated[bool, typer.Option("--fp16", help="Whether model uses FP16 precision.")] = False,
+    precision_constraints: Annotated[
+        str, typer.Option("--precision-constraints", help="Precision constraints for TensorRT (none, prefer, obey).")
+    ] = "none",
     profile: Annotated[bool, typer.Option("--profile", help="Whether to profile model execution.")] = False,
 ) -> None:
     """Run pure TensorRT inference for LightGlue model using Polygraphy (requires TensorRT to be installed)."""
@@ -359,11 +372,20 @@ def trtexec(
             images = DISKPreprocessor.preprocess(images)
     images = images.astype(np.float32)
 
+    precision_constraints_value = precision_constraints.lower()
+    if precision_constraints_value not in {"none", "prefer", "obey"}:
+        raise typer.BadParameter("precision-constraints must be one of: none, prefer, obey.")
+    if precision_constraints_value == "none":
+        precision_constraints_value = None
+
     # Build TensorRT engine
     if model_path.suffix == ".engine":
         build_engine = EngineFromBytes(BytesFromPath(str(model_path)))
     else:  # .onnx
-        build_engine = EngineFromNetwork(NetworkFromOnnxPath(str(model_path)), config=CreateConfig(fp16=fp16))
+        build_engine = EngineFromNetwork(
+            NetworkFromOnnxPath(str(model_path), strongly_typed=strongly_typed),
+            config=CreateConfig(fp16=fp16, precision_constraints=precision_constraints_value),
+        )
         build_engine = SaveEngine(build_engine, str(model_path.with_suffix(".engine")))
 
     def _print_cuda_runtime_hint() -> None:
@@ -392,19 +414,22 @@ def trtexec(
                 outputs = runner.infer(feed_dict={"images": images})
                 keypoints, matches, mscores = outputs["keypoints"], outputs["matches"], outputs["mscores"]  # noqa: F841
 
+            match_count = int(matches.shape[0])
+            typer.echo(f"Matches: {match_count}")
             if profile:
-                typer.echo(f"Inference Time: {runner.last_inference_time():.3f} s")
+                typer.echo(f"Inference Time: {runner.last_inference_time():.6f} s")
     except OSError as exc:
         if "libcudart" in str(exc):
             _print_cuda_runtime_hint()
         raise
 
-    viz.plot_images(raw_images)
-    viz.plot_matches(keypoints[0][matches[..., 1]], keypoints[1][matches[..., 2]], color="lime", lw=0.2)
-    if output_path is None:
-        viz.plt.show()
-    else:
-        viz.save_plot(output_path)
+    if output_path is not None or show:
+        viz.plot_images(raw_images)
+        viz.plot_matches(keypoints[0][matches[..., 1]], keypoints[1][matches[..., 2]], color="lime", lw=0.2)
+        if output_path is not None:
+            viz.save_plot(output_path)
+        if show:
+            viz.plt.show()
 
 
 def main() -> None:

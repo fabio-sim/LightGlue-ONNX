@@ -152,13 +152,13 @@ class MatchAssignment(nn.Module):
 
 def filter_matches(scores: torch.Tensor, threshold: float) -> tuple[torch.Tensor, torch.Tensor]:
     """obtain matches from a log assignment matrix [BxNxN]"""
-    max0 = torch.topk(scores, k=1, dim=2, sorted=False)  # scores.max(2)
-    max1 = torch.topk(scores, k=1, dim=1, sorted=False)  # scores.max(1)
-    m0, m1 = max0.indices[:, :, 0], max1.indices[:, 0, :]
+    max0 = scores.max(2)
+    max1 = scores.max(1)
+    m0, m1 = max0.indices, max1.indices
 
     indices = torch.arange(m0.shape[1], device=m0.device).expand_as(m0)
     mutual = indices == m1.gather(1, m0)
-    mscores = max0.values[:, :, 0].exp()
+    mscores = max0.values.exp()
     valid = mscores > threshold
 
     b_idx, m0_idx = torch.where(valid & mutual)
