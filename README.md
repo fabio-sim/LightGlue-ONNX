@@ -4,17 +4,19 @@
 [![TensorRT](https://img.shields.io/badge/TensorRT-76B900)](https://developer.nvidia.com/tensorrt)
 [![GitHub Repo stars](https://img.shields.io/github/stars/fabio-sim/LightGlue-ONNX)](https://github.com/fabio-sim/LightGlue-ONNX/stargazers)
 [![GitHub all releases](https://img.shields.io/github/downloads/fabio-sim/LightGlue-ONNX/total)](https://github.com/fabio-sim/LightGlue-ONNX/releases)
-[![Blog](https://img.shields.io/badge/Blog-blue)](https://fabio-sim.github.io/blog/accelerating-lightglue-inference-onnx-runtime-tensorrt/)
+[![Blog](https://img.shields.io/badge/Blog-blue)](https://fabio-sim.github.io)
 
 # LightGlue ONNX
 
-Open Neural Network Exchange (ONNX) compatible implementation of [LightGlue: Local Feature Matching at Light Speed](https://github.com/cvg/LightGlue). The ONNX model format allows for interoperability across different platforms with support for multiple execution providers, and removes Python-specific dependencies such as PyTorch. Supports TensorRT and OpenVINO.
+Open Neural Network Exchange (ONNX) compatible implementation of [LightGlue: Local Feature Matching at Light Speed](https://github.com/cvg/LightGlue). The ONNX model format allows for interoperability across different platforms with support for multiple execution providers, and removes Python-specific dependencies such as PyTorch. Supports TensorRT and OpenVINO. [Detailed write-up](https://fabio-sim.github.io).
 
-> ✨ ***What's New***: End-to-end parallel dynamic batch size support. Read more in this [blog post](https://fabio-sim.github.io/blog/accelerating-lightglue-inference-onnx-runtime-tensorrt/).
+> ✨ ***What's New***: FP8 Quantization Workflow. Read more in this [blog post](https://fabio-sim.github.io/blog/fp8-quantized-lightglue-tensorrt-nvidia-model-optimizer/).
 
 <p align="center"><a href="https://fabio-sim.github.io/blog/accelerating-lightglue-inference-onnx-runtime-tensorrt/"><img src="assets/inference-comparison-speedup.svg" alt="Latency Comparison" width=90%></a><br><em>⏱️ Inference Time Comparison</em></p>
 
 <p align="center"><a href="https://arxiv.org/abs/2306.13643"><img src="assets/easy_hard.jpg" alt="LightGlue figure" width=80%></a></p>
+
+**19 January 2026**: Add FP8 quantization workflow (ModelOpt Q/DQ export and TensorRT usage notes).
 
 <details>
 <summary>Changelog</summary>
@@ -139,6 +141,35 @@ uv run lightglue-onnx trtexec \
   superpoint \
   -h 1024 -w 1024 \
   --fp16
+</pre>
+</details>
+
+<details>
+<summary>🧪 Quantization (FP8 Q/DQ for TensorRT)</summary>
+<pre>
+# 1) Export a static-shape ONNX model
+uv run lightglue-onnx export superpoint \
+  --num-keypoints 1024 \
+  -b 2 -h 1024 -w 1024 \
+  -o weights/superpoint_lightglue_pipeline.static.onnx
+
+# 2) Quantize to FP8 (DQ-only graph)
+uv run lightglue_dynamo/scripts/quantize.py \
+  --input weights/superpoint_lightglue_pipeline.static.onnx \
+  --output weights/superpoint_lightglue_pipeline.static.fp8.onnx \
+  --extractor superpoint \
+  --height 1024 --width 1024 \
+  --quantize-mode fp8 \
+  --dq-only \
+  --simplify
+
+# 3) Run TensorRT (explicit quantized model)
+uv run lightglue-onnx trtexec \
+  weights/superpoint_lightglue_pipeline.static.fp8.onnx \
+  assets/sacre_coeur1.jpg assets/sacre_coeur2.jpg \
+  superpoint \
+  -h 1024 -w 1024 \
+  --precision-constraints prefer --fp16
 </pre>
 </details>
 

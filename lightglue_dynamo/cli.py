@@ -150,7 +150,7 @@ def export(
         export_model(False)
         onnx.checker.check_model(output)
     try:
-        inferred = SymbolicShapeInference.infer_shapes(onnx.load_model(output), auto_merge=True)  # type: ignore
+        inferred = SymbolicShapeInference.infer_shapes(onnx.load_model(output), auto_merge=True)
         onnx.save_model(inferred, output)
     except Exception as exc:
         typer.echo(f"Warning: Symbolic shape inference failed ({exc}). Falling back to onnx.shape_inference.")
@@ -372,6 +372,9 @@ def trtexec(
             images = DISKPreprocessor.preprocess(images)
     images = images.astype(np.float32)
 
+    if strongly_typed and precision_constraints.lower() != "none":
+        raise typer.BadParameter("precision-constraints must be 'none' when --strongly-typed is set.")
+
     precision_constraints_value = precision_constraints.lower()
     if precision_constraints_value not in {"none", "prefer", "obey"}:
         raise typer.BadParameter("precision-constraints must be one of: none, prefer, obey.")
@@ -410,14 +413,25 @@ def trtexec(
 
     try:
         with TrtRunner(build_engine) as runner:
-            for _ in range(10 if profile else 1):  # Warm-up if profiling
+            warmup_runs = 10 if profile else 0
+            if warmup_runs:
+                for _ in range(warmup_runs):
+                    outputs = runner.infer(feed_dict={"images": images})
+                    keypoints, matches, mscores = outputs["keypoints"], outputs["matches"], outputs["mscores"]
+
+            measured_runs = 100 if profile else 1
+            inference_times: list[float] = []
+            for _ in range(measured_runs):
                 outputs = runner.infer(feed_dict={"images": images})
                 keypoints, matches, mscores = outputs["keypoints"], outputs["matches"], outputs["mscores"]  # noqa: F841
+                if profile:
+                    inference_times.append(runner.last_inference_time())
 
             match_count = int(matches.shape[0])
             typer.echo(f"Matches: {match_count}")
             if profile:
-                typer.echo(f"Inference Time: {runner.last_inference_time():.6f} s")
+                median_time = float(np.median(np.asarray(inference_times, dtype=np.float64)))
+                typer.echo(f"Inference Time (median over 100 runs, 10 warmup): {median_time:.6f} s")
     except OSError as exc:
         if "libcudart" in str(exc):
             _print_cuda_runtime_hint()

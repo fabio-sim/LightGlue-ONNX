@@ -4,17 +4,19 @@
 [![TensorRT](https://img.shields.io/badge/TensorRT-76B900)](https://developer.nvidia.com/tensorrt)
 [![GitHub Repo stars](https://img.shields.io/github/stars/fabio-sim/LightGlue-ONNX)](https://github.com/fabio-sim/LightGlue-ONNX/stargazers)
 [![GitHub all releases](https://img.shields.io/github/downloads/fabio-sim/LightGlue-ONNX/total)](https://github.com/fabio-sim/LightGlue-ONNX/releases)
-[![Blog](https://img.shields.io/badge/Blog-blue)](https://fabio-sim.github.io/blog/accelerating-lightglue-inference-onnx-runtime-tensorrt/)
+[![Blog](https://img.shields.io/badge/Blog-blue)](https://fabio-sim.github.io)
 
 # LightGlue ONNX
 
-[LightGlue: Local Feature Matching at Light Speed](https://github.com/cvg/LightGlue) の ONNX（Open Neural Network Exchange）互換実装です。ONNX モデルフォーマットにより、複数の実行プロバイダーに対応し、さまざまなプラットフォーム間での相互運用性が向上します。また、PyTorch などの Python 固有の依存関係を排除します。TensorRT および OpenVINO をサポートしています。
+[LightGlue: Local Feature Matching at Light Speed](https://github.com/cvg/LightGlue) の ONNX（Open Neural Network Exchange）互換実装です。ONNX モデルフォーマットにより、複数の実行プロバイダーに対応し、さまざまなプラットフォーム間での相互運用性が向上します。また、PyTorch などの Python 固有の依存関係を排除します。TensorRT および OpenVINO をサポートしています。[詳細記事](https://fabio-sim.github.io)。
 
-> ✨ ***新機能***: エンドツーエンドの並列動的バッチサイズのサポート。詳細はこの [ブログ記事](https://fabio-sim.github.io/blog/accelerating-lightglue-inference-onnx-runtime-tensorrt/) をご覧ください。
+> ✨ ***新機能***: FP8 量子化ワークフロー。詳細はこの [ブログ記事](https://fabio-sim.github.io/blog/fp8-quantized-lightglue-tensorrt-nvidia-model-optimizer/) をご覧ください。
 
 <p align="center"><a href="https://fabio-sim.github.io/blog/accelerating-lightglue-inference-onnx-runtime-tensorrt/"><img src="../assets/inference-comparison-speedup.svg" alt="レイテンシ比較" width=90%></a><br><em>⏱️ 推論時間の比較</em></p>
 
 <p align="center"><a href="https://arxiv.org/abs/2306.13643"><img src="../assets/easy_hard.jpg" alt="LightGlue 図" width=80%></a></p>
+
+**2026年1月19日**: FP8 量子化ワークフローのガイドを追加（ModelOpt Q/DQ エクスポートと TensorRT の使用）。
 
 <details>
 <summary>更新履歴</summary>
@@ -126,6 +128,35 @@ uv run lightglue-onnx trtexec \
   superpoint \
   -h 1024 -w 1024 \
   --fp16
+</pre>
+</details>
+
+<details>
+<summary>🧪 量子化（TensorRT FP8 Q/DQ）</summary>
+<pre>
+# 1) 静的形状の ONNX モデルをエクスポート
+uv run lightglue-onnx export superpoint \
+  --num-keypoints 1024 \
+  -b 2 -h 1024 -w 1024 \
+  -o weights/superpoint_lightglue_pipeline.static.onnx
+
+# 2) FP8 に量子化（DQ-only グラフ）
+uv run lightglue_dynamo/scripts/quantize.py \
+  --input weights/superpoint_lightglue_pipeline.static.onnx \
+  --output weights/superpoint_lightglue_pipeline.static.fp8.onnx \
+  --extractor superpoint \
+  --height 1024 --width 1024 \
+  --quantize-mode fp8 \
+  --dq-only \
+  --simplify
+
+# 3) TensorRT で推論（明示的に量子化されたモデル）
+uv run lightglue-onnx trtexec \
+  weights/superpoint_lightglue_pipeline.static.fp8.onnx \
+  assets/sacre_coeur1.jpg assets/sacre_coeur2.jpg \
+  superpoint \
+  -h 1024 -w 1024 \
+  --precision-constraints prefer --fp16
 </pre>
 </details>
 

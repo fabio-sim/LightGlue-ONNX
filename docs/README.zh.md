@@ -4,17 +4,19 @@
 [![TensorRT](https://img.shields.io/badge/TensorRT-76B900)](https://developer.nvidia.com/tensorrt)
 [![GitHub Repo stars](https://img.shields.io/github/stars/fabio-sim/LightGlue-ONNX)](https://github.com/fabio-sim/LightGlue-ONNX/stargazers)
 [![GitHub all releases](https://img.shields.io/github/downloads/fabio-sim/LightGlue-ONNX/total)](https://github.com/fabio-sim/LightGlue-ONNX/releases)
-[![Blog](https://img.shields.io/badge/Blog-blue)](https://fabio-sim.github.io/blog/accelerating-lightglue-inference-onnx-runtime-tensorrt/)
+[![Blog](https://img.shields.io/badge/Blog-blue)](https://fabio-sim.github.io)
 
 # LightGlue ONNX
 
-兼容 Open Neural Network Exchange (ONNX) 的 [LightGlue: Local Feature Matching at Light Speed](https://github.com/cvg/LightGlue) 实现。ONNX 模型格式支持跨平台互操作性，支持多种执行提供程序，并消除了诸如 PyTorch 之类的 Python 特定依赖。支持 TensorRT 和 OpenVINO。
+兼容 Open Neural Network Exchange (ONNX) 的 [LightGlue: Local Feature Matching at Light Speed](https://github.com/cvg/LightGlue) 实现。ONNX 模型格式支持跨平台互操作性，支持多种执行提供程序，并消除了诸如 PyTorch 之类的 Python 特定依赖。支持 TensorRT 和 OpenVINO。[详细介绍](https://fabio-sim.github.io)。
 
-> ✨ ***更新内容***：支持端到端并行动态批量大小。阅读更多内容，请查看这篇[博客文章](https://fabio-sim.github.io/blog/accelerating-lightglue-inference-onnx-runtime-tensorrt/)。
+> ✨ ***更新内容***：FP8 量化工作流。阅读更多内容，请查看这篇[博客文章](https://fabio-sim.github.io/blog/fp8-quantized-lightglue-tensorrt-nvidia-model-optimizer/)。
 
 <p align="center"><a href="https://fabio-sim.github.io/blog/accelerating-lightglue-inference-onnx-runtime-tensorrt/"><img src="../assets/inference-comparison-speedup.svg" alt="延迟对比" width=90%></a><br><em>⏱️ 推理时间对比</em></p>
 
 <p align="center"><a href="https://arxiv.org/abs/2306.13643"><img src="../assets/easy_hard.jpg" alt="LightGlue 图示" width=80%></a></p>
+
+**2026年1月19日**：添加 FP8 量化工作流说明（ModelOpt Q/DQ 导出与 TensorRT 用法）。
 
 <details>
 <summary>更新日志</summary>
@@ -126,6 +128,35 @@ uv run lightglue-onnx trtexec \
   superpoint \
   -h 1024 -w 1024 \
   --fp16
+</pre>
+</details>
+
+<details>
+<summary>🧪 量化（TensorRT FP8 Q/DQ）</summary>
+<pre>
+# 1) 导出静态形状 ONNX 模型
+uv run lightglue-onnx export superpoint \
+  --num-keypoints 1024 \
+  -b 2 -h 1024 -w 1024 \
+  -o weights/superpoint_lightglue_pipeline.static.onnx
+
+# 2) 量化为 FP8（DQ-only 图）
+uv run lightglue_dynamo/scripts/quantize.py \
+  --input weights/superpoint_lightglue_pipeline.static.onnx \
+  --output weights/superpoint_lightglue_pipeline.static.fp8.onnx \
+  --extractor superpoint \
+  --height 1024 --width 1024 \
+  --quantize-mode fp8 \
+  --dq-only \
+  --simplify
+
+# 3) 运行 TensorRT（显式量化模型）
+uv run lightglue-onnx trtexec \
+  weights/superpoint_lightglue_pipeline.static.fp8.onnx \
+  assets/sacre_coeur1.jpg assets/sacre_coeur2.jpg \
+  superpoint \
+  -h 1024 -w 1024 \
+  --precision-constraints prefer --fp16
 </pre>
 </details>
 
