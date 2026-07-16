@@ -6,7 +6,7 @@ import torch
 
 from lightglue_dynamo.config import Extractor
 from lightglue_dynamo.models import Pipeline
-from lightglue_dynamo.models.aliked import DeformableConv2d
+from lightglue_dynamo.models.aliked import DeformableConv2d, SparseDescriptorHead
 from lightglue_dynamo.models.lightglue import LightGlue
 from lightglue_dynamo.models.raco import RaCo
 from lightglue_dynamo.preprocessors import RaCoPreprocessor
@@ -67,6 +67,85 @@ def test_portable_deform_conv_matches_torchvision() -> None:
         expected = native(tensor)
         actual = portable(tensor)
     torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+
+
+def _reference_sparse_descriptors(
+    head: SparseDescriptorHead, features: torch.Tensor, keypoints: torch.Tensor
+) -> torch.Tensor:
+    _batch, channels, height, width = features.shape
+    scale = features.new_tensor([width - 1, height - 1])
+    descriptors = []
+    for index, points in enumerate(keypoints):
+        pixel_points = (points / 2 + 0.5) * scale
+        corners = (pixel_points.long() - head.kernel_size / 2 + 1).long()
+        x_corner = corners[:, 0].clamp(0, width - 1 - head.kernel_size)
+        y_corner = corners[:, 1].clamp(0, height - 1 - head.kernel_size)
+        offset = torch.arange(head.kernel_size, device=features.device)
+        y, x = torch.meshgrid(offset, offset, indexing="ij")
+        x = x[..., None] + x_corner
+        y = y[..., None] + y_corner
+        patches = features[index, :, y, x].permute(3, 0, 1, 2)
+        offsets = head.offset_conv(patches).clamp(-max(height, width) / 4.0, max(height, width) / 4.0)
+        offsets = offsets[:, :, 0, 0].reshape(points.shape[0], 2, head.positions).transpose(1, 2)
+        positions = pixel_points[:, None] + offsets
+        positions = (2 * positions / scale - 1).reshape(1, -1, 1, 2)
+        sampled = torch.nn.functional.grid_sample(
+            features[index : index + 1], positions, mode="bilinear", align_corners=True
+        )
+        sampled = sampled.reshape(channels, points.shape[0], head.positions, 1).permute(1, 0, 2, 3)
+        sampled = torch.nn.functional.selu(head.sf_conv(sampled)).squeeze(-1)
+        descriptor = torch.einsum("ncp,pcd->nd", sampled, head.agg_weights)
+        descriptors.append(torch.nn.functional.normalize(descriptor, p=2, dim=1))
+    return torch.stack(descriptors)
+
+
+@pytest.mark.parametrize("batch", [1, 2, 3])
+def test_batched_sparse_descriptors_match_reference(batch: int) -> None:
+    torch.manual_seed(1)
+    head = SparseDescriptorHead(dimensions=8, positions=4).eval()
+    features = torch.randn(batch, 8, 11, 13)
+    keypoints = torch.rand(batch, 7, 2) * 2 - 1
+    with torch.inference_mode():
+        expected = _reference_sparse_descriptors(head, features, keypoints)
+        actual = head(features, keypoints)
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_sparse_descriptor_export_preserves_dynamic_batch() -> None:
+    torch.manual_seed(2)
+    head = SparseDescriptorHead(dimensions=8, positions=4).eval()
+    features = torch.randn(2, 8, 11, 13)
+    keypoints = torch.rand(2, 7, 2) * 2 - 1
+    batch = torch.export.Dim("batch", min=1)
+    height = torch.export.Dim("height", min=4)
+    width = torch.export.Dim("width", min=4)
+    exported = torch.export.export(
+        head, (features, keypoints), dynamic_shapes=({0: batch, 2: height, 3: width}, {0: batch})
+    )
+
+    dynamic_features = torch.randn(3, 8, 12, 15)
+    dynamic_keypoints = torch.rand(3, 7, 2) * 2 - 1
+    with torch.inference_mode():
+        expected = head(dynamic_features, dynamic_keypoints)
+        actual = exported.module()(dynamic_features, dynamic_keypoints)
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_raco_export_preserves_dynamic_spatial_shapes() -> None:
+    torch.manual_seed(3)
+    detector = RaCo(num_keypoints=128, weights=None).eval()
+    height_factor = torch.export.Dim("height_factor", min=2)
+    width_factor = torch.export.Dim("width_factor", min=2)
+    exported = torch.export.export(
+        detector, (torch.rand(1, 3, 64, 96),), dynamic_shapes=({2: 32 * height_factor, 3: 32 * width_factor},)
+    )
+
+    images = torch.rand(1, 3, 96, 64)
+    with torch.inference_mode():
+        expected = detector(images)
+        actual = exported.module()(images)
+    for actual_output, expected_output in zip(actual, expected, strict=True):
+        torch.testing.assert_close(actual_output, expected_output, atol=1e-5, rtol=1e-5)
 
 
 def test_adaptive_depth_skips_unneeded_layers(monkeypatch: pytest.MonkeyPatch) -> None:

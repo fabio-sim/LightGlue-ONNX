@@ -6,18 +6,22 @@ import torch.nn.functional as F
 import torchvision
 from torch import nn
 
+from ..ops.shape_utils import shape_as_tensor
+
 
 def _get_patches(tensor: torch.Tensor, keypoints: torch.Tensor, size: int) -> torch.Tensor:
-    channels, height, width = tensor.shape
+    batch, channels, height, width = tensor.shape
     corners = (keypoints - size / 2 + 1).long()
-    x_corner = corners[:, 0].clamp(0, width - 1 - size)
-    y_corner = corners[:, 1].clamp(0, height - 1 - size)
+    x_corner = corners[..., 0].clamp(0, width - 1 - size)
+    y_corner = corners[..., 1].clamp(0, height - 1 - size)
     offset = torch.arange(size, device=tensor.device)
-    y, x = torch.meshgrid(offset, offset, indexing="ij")
-    x = x[..., None] + x_corner
-    y = y[..., None] + y_corner
-    sampled = tensor[:, y, x].permute(3, 0, 1, 2)
-    return sampled.reshape(keypoints.shape[0], channels, size, size)
+    y_offset, x_offset = torch.meshgrid(offset, offset, indexing="ij")
+    x = x_corner[..., None, None] + x_offset
+    y = y_corner[..., None, None] + y_offset
+    linear_indices = (y * width + x).flatten(1)
+    linear_indices = linear_indices[:, None].expand(-1, channels, -1)
+    sampled = torch.gather(tensor.flatten(2), 2, linear_indices)
+    return sampled.reshape(batch, channels, keypoints.shape[1], size, size).permute(0, 2, 1, 3, 4)
 
 
 class DeformableConv2d(nn.Module):
@@ -28,7 +32,7 @@ class DeformableConv2d(nn.Module):
         self.regular_conv = nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False)
 
     def forward(self, tensor: torch.Tensor) -> torch.Tensor:
-        maximum = max(tensor.shape[-2], tensor.shape[-1]) / 4.0
+        maximum = shape_as_tensor(tensor)[-2:].to(tensor).max() / 4.0
         offsets = self.offset_conv(tensor).clamp(-maximum, maximum)
         if self.portable:
             return self._portable_deform_conv2d(tensor, offsets)
@@ -50,13 +54,14 @@ class DeformableConv2d(nn.Module):
             torch.arange(width, device=tensor.device, dtype=dtype),
             indexing="ij",
         )
+        spatial_shape = shape_as_tensor(tensor)[-2:].to(tensor)
         samples: list[torch.Tensor] = []
         for kernel_index in range(9):
             kernel_y, kernel_x = divmod(kernel_index, 3)
             y = y_base + kernel_y - 1 + offsets[:, 2 * kernel_index]
             x = x_base + kernel_x - 1 + offsets[:, 2 * kernel_index + 1]
-            grid_x = 2 * x / max(width - 1, 1) - 1
-            grid_y = 2 * y / max(height - 1, 1) - 1
+            grid_x = 2 * x / (spatial_shape[1] - 1).clamp(min=1) - 1
+            grid_y = 2 * y / (spatial_shape[0] - 1).clamp(min=1) - 1
             grid = torch.stack((grid_x, grid_y), dim=-1)
             samples.append(F.grid_sample(tensor, grid, mode="bilinear", align_corners=True))
         sampled = torch.stack(samples, dim=1)
@@ -126,24 +131,24 @@ class SparseDescriptorHead(nn.Module):
         self.agg_weights = nn.Parameter(torch.rand(positions, dimensions, dimensions))
 
     def forward(self, features: torch.Tensor, keypoints: torch.Tensor) -> torch.Tensor:
-        batch, channels, height, width = features.shape
-        scale = features.new_tensor([width - 1, height - 1])
-        descriptors: list[torch.Tensor] = []
-        for index in range(batch):
-            points = keypoints[index]
-            pixel_points = (points / 2 + 0.5) * scale
-            # ALIKED intentionally quantizes patch centers before estimating offsets.
-            patches = _get_patches(features[index], pixel_points.long(), self.kernel_size)
-            offsets = self.offset_conv(patches).clamp(-max(height, width) / 4.0, max(height, width) / 4.0)
-            offsets = offsets[:, :, 0, 0].reshape(points.shape[0], 2, self.positions).transpose(1, 2)
-            positions = pixel_points[:, None] + offsets
-            positions = (2 * positions / scale - 1).reshape(1, -1, 1, 2)
-            sampled = F.grid_sample(features[index : index + 1], positions, mode="bilinear", align_corners=True)
-            sampled = sampled.reshape(channels, points.shape[0], self.positions, 1).permute(1, 0, 2, 3)
-            sampled = F.selu(self.sf_conv(sampled)).squeeze(-1)
-            descriptor = torch.einsum("ncp,pcd->nd", sampled, self.agg_weights)
-            descriptors.append(F.normalize(descriptor, p=2, dim=1))
-        return torch.stack(descriptors)
+        batch, channels = features.shape[:2]
+        shape = shape_as_tensor(features)
+        scale = torch.stack((shape[-1], shape[-2])).to(features) - 1
+        point_count = keypoints.shape[1]
+        pixel_points = (keypoints / 2 + 0.5) * scale
+        # ALIKED intentionally quantizes patch centers before estimating offsets.
+        patches = _get_patches(features, pixel_points.long(), self.kernel_size)
+        patches = patches.flatten(0, 1)
+        maximum = shape[-2:].to(features).max() / 4.0
+        offsets = self.offset_conv(patches).clamp(-maximum, maximum)
+        offsets = offsets[:, :, 0, 0].reshape(batch, point_count, 2, self.positions).transpose(2, 3)
+        positions = pixel_points[:, :, None] + offsets
+        positions = (2 * positions / scale - 1).reshape(batch, point_count * self.positions, 1, 2)
+        sampled = F.grid_sample(features, positions, mode="bilinear", align_corners=True)
+        sampled = F.selu(self.sf_conv(sampled)).reshape(batch, channels, point_count, self.positions)
+        sampled = sampled.permute(0, 2, 1, 3)
+        descriptor = torch.einsum("bncp,pcd->bnd", sampled, self.agg_weights)
+        return F.normalize(descriptor, p=2, dim=2)
 
 
 class ALIKEDDescriptor(nn.Module):
@@ -191,7 +196,8 @@ class ALIKEDDescriptor(nn.Module):
         return F.normalize(features, p=2, dim=1)
 
     def forward(self, image: torch.Tensor, keypoints: torch.Tensor) -> torch.Tensor:
-        scale = image.new_tensor([image.shape[-1] - 1, image.shape[-2] - 1])
+        shape = shape_as_tensor(image)
+        scale = torch.stack((shape[-1], shape[-2])).to(image) - 1
         normalized_keypoints = 2 * keypoints / scale - 1
         return self.desc_head(self._dense_features(image), normalized_keypoints)
 

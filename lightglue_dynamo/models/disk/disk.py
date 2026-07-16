@@ -15,13 +15,8 @@ def heatmap_to_keypoints(heatmap: torch.Tensor, n: int, window_size: int = 5) ->
     # Select top-K
     top_scores, top_indices = heatmap.reshape(b, h * w).topk(n)
     shape = shape_as_tensor(heatmap).to(device=top_indices.device)
-    h_i = shape[-2]
     w_i = shape[-1]
-    one = h_i.new_tensor(1)
-    denom = torch.stack([w_i, one])
-    mod = torch.stack([h_i, w_i])
-    top_indices = top_indices.unsqueeze(2).floor_divide(denom) % mod
-    top_keypoints = top_indices.flip(2)
+    top_keypoints = torch.stack([top_indices % w_i, top_indices // w_i], dim=-1)
 
     return top_keypoints, top_scores
 
@@ -43,7 +38,8 @@ class DISK(torch.nn.Module):
 
         self.unet = Unet(in_features=3, size=5, down=[16, 32, 64, 64, 64], up=[64, 64, 64, descriptor_dim + 1])
 
-        self.load_state_dict(torch.hub.load_state_dict_from_url(self.url)["extractor"])
+        checkpoint = torch.hub.load_state_dict_from_url(self.url, map_location="cpu", weights_only=True)
+        self.load_state_dict(checkpoint["extractor"])
 
     def forward(
         self,

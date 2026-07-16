@@ -1,3 +1,4 @@
+from math import ceil, sqrt
 from pathlib import Path
 from typing import Annotated, cast
 
@@ -37,19 +38,6 @@ def export(
     num_keypoints: Annotated[
         int, typer.Option(min=128, help="Number of keypoints outputted by feature extractor.")
     ] = 1024,
-    fuse_multi_head_attention: Annotated[
-        bool,
-        typer.Option(
-            "--fuse-multi-head-attention",
-            help="Fuse multi-head attention subgraph into one optimized operation. (ONNX Runtime-only).",
-        ),
-    ] = False,
-    dynamo_export: Annotated[
-        bool,
-        typer.Option(
-            "--dynamo-export/--legacy-export", help="Use the TorchDynamo ONNX exporter. Legacy export uses TorchScript."
-        ),
-    ] = True,
     opset: Annotated[int, typer.Option(min=16, max=20, help="ONNX opset version of exported model.")] = 20,
     portable_deform_conv: Annotated[
         bool,
@@ -63,11 +51,9 @@ def export(
     """Export LightGlue to ONNX."""
     import onnx
     import torch
-    from onnxruntime.tools.symbolic_shape_infer import SymbolicShapeInference
     from onnxruntime.transformers.float16 import convert_float_to_float16
 
     from lightglue_dynamo.models import DISK, LightGlue, Pipeline, RaCoALIKED, SuperPoint
-    from lightglue_dynamo.ops import use_fused_multi_head_attention
 
     match extractor_type:
         case Extractor.superpoint:
@@ -77,11 +63,6 @@ def export(
         case Extractor.raco_aliked:
             if opset < 20:
                 raise typer.BadParameter("raco_aliked export requires ONNX opset 20.")
-            if batch_size == 0 or height == 0 or width == 0:
-                raise typer.BadParameter(
-                    "raco_aliked currently requires a static batch, height, and width; "
-                    "the current PyTorch exporter cannot preserve its dynamic top-k and descriptor sampling."
-                )
             extractor = RaCoALIKED(num_keypoints=num_keypoints, portable_deform_conv=portable_deform_conv)
     matcher = LightGlue(**extractor_type.lightglue_config)
     pipeline = Pipeline(extractor, matcher).eval()
@@ -98,50 +79,36 @@ def export(
     if height > 0 and width > 0 and num_keypoints > height * width:
         raise typer.BadParameter("num_keypoints cannot be greater than height * width.")
 
-    if fuse_multi_head_attention:
-        typer.echo(
-            "Warning: Multi-head attention nodes will be fused. Exported model will only work with ONNX Runtime CPU & CUDA execution providers."
-        )
-        torch_version = tuple(int(part) for part in torch.__version__.split("+")[0].split(".")[:3])
-        if torch_version < (2, 4):
-            raise typer.Abort("Fused multi-head attention requires PyTorch 2.4 or later.")
-        use_fused_multi_head_attention()
-        if dynamo_export:
-            typer.echo(
-                "Warning: Fused multi-head attention is not supported by the Dynamo exporter. Using legacy export."
-            )
+    def build_dynamic_shapes() -> tuple[dict[int, object], ...] | None:
+        image_shapes: dict[int, object] = {}
+        divisor = extractor_type.input_dim_divisor
+        square_factor = max(2, ceil(sqrt(num_keypoints) / divisor))
+        if batch_size == 0:
+            pair_count = torch.export.Dim("pair_count", min=1)
+            image_shapes[0] = 2 * pair_count
+        if height == 0:
+            minimum_height_factor = max(2, ceil(num_keypoints / width / divisor)) if width else square_factor
+            height_factor = torch.export.Dim("height_factor", min=minimum_height_factor)
+            image_shapes[2] = divisor * height_factor
+        if width == 0:
+            minimum_width_factor = max(2, ceil(num_keypoints / height / divisor)) if height else square_factor
+            width_factor = torch.export.Dim("width_factor", min=minimum_width_factor)
+            image_shapes[3] = divisor * width_factor
+        return (image_shapes,) if image_shapes else None
 
-    def build_dynamic_config(
-        use_dynamo: bool,
-    ) -> tuple[dict[str, dict[int, str]] | None, tuple[dict[int, str], ...] | None]:
-        dynamic_axes: dict[str, dict[int, str]] | None = None
-        dynamic_shapes: tuple[dict[int, str], ...] | None = None
-        if use_dynamo:
-            image_shapes: dict[int, str] = {}
-            if batch_size == 0:
-                image_shapes[0] = "batch_size"
-            if height == 0:
-                image_shapes[2] = "height"
-            if width == 0:
-                image_shapes[3] = "width"
-            if image_shapes:
-                dynamic_shapes = (image_shapes,)
+    def export_model() -> None:
+        example_batch = batch_size or 4
+        divisor = extractor_type.input_dim_divisor
+        dynamic_side = max(2 * divisor, ceil(sqrt(num_keypoints) / divisor) * divisor)
+        if height == 0 and width > 0:
+            example_height = max(2 * divisor, ceil(num_keypoints / width / divisor) * divisor)
         else:
-            dynamic_axes = {"matches": {0: "num_matches"}, "mscores": {0: "num_matches"}}
-            dynamic_axes["images"] = {}
-            dynamic_axes["keypoints"] = {}
-            if batch_size == 0:
-                dynamic_axes["images"][0] = "batch_size"
-                dynamic_axes["keypoints"][0] = "batch_size"
-            if height == 0:
-                dynamic_axes["images"][2] = "height"
-            if width == 0:
-                dynamic_axes["images"][3] = "width"
-        return dynamic_axes, dynamic_shapes
-
-    def export_model(use_dynamo: bool) -> None:
-        dynamic_axes, dynamic_shapes = build_dynamic_config(use_dynamo)
-        inputs = (torch.zeros(batch_size or 2, extractor_type.input_channels, height or 256, width or 256),)
+            example_height = height or dynamic_side
+        if width == 0 and height > 0:
+            example_width = max(2 * divisor, ceil(num_keypoints / height / divisor) * divisor)
+        else:
+            example_width = width or dynamic_side
+        inputs = (torch.zeros(example_batch, extractor_type.input_channels, example_height, example_width),)
         torch.onnx.export(
             pipeline,
             inputs,
@@ -149,34 +116,14 @@ def export(
             input_names=["images"],
             output_names=output_names,
             opset_version=opset,
-            dynamic_axes=dynamic_axes,
-            dynamic_shapes=dynamic_shapes,
-            dynamo=use_dynamo,
+            dynamic_shapes=build_dynamic_shapes(),
+            dynamo=True,
+            external_data=False,
+            optimize=False,
         )
 
-    use_dynamo = dynamo_export and not fuse_multi_head_attention
-    try:
-        export_model(use_dynamo)
-        onnx.checker.check_model(output)
-    except Exception as exc:
-        if not use_dynamo or extractor_type == Extractor.raco_aliked:
-            raise
-        typer.echo(
-            f"Warning: Dynamo exporter failed ({exc}). Falling back to legacy exporter. "
-            "Use --legacy-export to skip Dynamo."
-        )
-        export_model(False)
-        onnx.checker.check_model(output)
-    try:
-        inferred = SymbolicShapeInference.infer_shapes(onnx.load_model(output), auto_merge=True)
-        onnx.save_model(inferred, output)
-    except Exception as exc:
-        typer.echo(f"Warning: Symbolic shape inference failed ({exc}). Falling back to onnx.shape_inference.")
-        try:
-            inferred = onnx.shape_inference.infer_shapes(onnx.load_model(output))
-            onnx.save_model(inferred, output)
-        except Exception as fallback_exc:
-            typer.echo(f"Warning: onnx.shape_inference failed ({fallback_exc}). Skipping.")
+    export_model()
+    onnx.checker.check_model(output)
     typer.echo(f"Successfully exported model to {output}")
     if fp16:
         typer.echo(

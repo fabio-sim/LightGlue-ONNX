@@ -4,6 +4,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from ..ops.shape_utils import shape_as_tensor
+
 
 class ConvBlock(nn.Module):
     def __init__(self, in_channels: int, out_channels: int) -> None:
@@ -56,8 +58,8 @@ def _subpixel_offsets(logits: torch.Tensor, indices: torch.Tensor, nms_radius: i
 
 
 def _sample(feature_map: torch.Tensor, keypoints: torch.Tensor) -> torch.Tensor:
-    height, width = feature_map.shape[-2:]
-    scale = keypoints.new_tensor([width - 1, height - 1])
+    shape = shape_as_tensor(feature_map)
+    scale = torch.stack((shape[-1], shape[-2])).to(keypoints) - 1
     grid = (2 * keypoints / scale - 1).unsqueeze(2)
     sampled = F.grid_sample(feature_map, grid, mode="bilinear", padding_mode="border", align_corners=True)
     sampled = sampled.squeeze(-1).transpose(1, 2)
@@ -150,8 +152,10 @@ class RaCo(nn.Module):
         nms = F.max_pool2d(probabilities, self.nms_radius, stride=1, padding=self.nms_radius // 2)
         probabilities_nms = probabilities * (probabilities == nms)
         top = probabilities_nms.flatten(1).topk(self.num_keypoints)
-        width = probabilities.shape[-1]
-        keypoints = torch.stack((top.indices % width, top.indices // width), dim=-1).to(probabilities.dtype)
+        width = shape_as_tensor(probabilities)[-1]
+        x = torch.remainder(top.indices, width)
+        y = torch.div(top.indices, width, rounding_mode="floor")
+        keypoints = torch.stack((x, y), dim=-1).to(probabilities.dtype)
         if self.subpixel_sampling:
             keypoints = keypoints + _subpixel_offsets(logits, top.indices, self.nms_radius, self.subpixel_temperature)
         detection_scores = _sample(probabilities, keypoints)

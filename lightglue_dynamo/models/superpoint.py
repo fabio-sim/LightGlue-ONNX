@@ -163,11 +163,8 @@ class SuperPoint(nn.Module):
         # Select top-K keypoints
         top_scores, top_indices = scores.reshape(b, h * s * w * s).topk(self.num_keypoints)
         s_i = h_i.new_tensor(s)
-        one = h_i.new_tensor(1)
-        denom = torch.stack([w_i * s_i, one])
-        mod = torch.stack([h_i * s_i, w_i * s_i])
-        top_indices = top_indices.unsqueeze(2).floor_divide(denom) % mod
-        top_keypoints = top_indices.flip(2)
+        image_width = w_i * s_i
+        top_keypoints = torch.stack([top_indices % image_width, top_indices // image_width], dim=-1)
 
         # Compute the dense descriptors
         cDa = self.relu(self.convDa(x))

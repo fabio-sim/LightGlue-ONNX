@@ -106,17 +106,6 @@ uv run lightglue-onnx export superpoint \
 </details>
 
 <details>
-<summary>🧰 Legacy Export Fallback</summary>
-<pre>
-uv run lightglue-onnx export superpoint \
-  --num-keypoints 1024 \
-  -b 2 -h 1024 -w 1024 \
-  --legacy-export \
-  -o weights/superpoint_lightglue_pipeline.onnx
-</pre>
-</details>
-
-<details>
 <summary>⚡ ONNX Runtime Inference (CUDA)</summary>
 <pre>
 uv run lightglue-onnx infer \

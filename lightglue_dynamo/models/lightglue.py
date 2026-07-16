@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from ..ops import multi_head_attention_dispatch
+from ..ops import multi_head_attention
 
 torch.backends.cudnn.deterministic = True
 
@@ -26,8 +26,8 @@ class LearnableFourierPositionalEncoding(nn.Module):
         """encode position vector"""
         projected = self.Wr(x)
         cosines, sines = torch.cos(projected), torch.sin(projected)
-        emb = torch.stack([cosines, sines])
-        return emb.repeat_interleave(2, dim=3).repeat(1, 1, 1, self.num_heads).unsqueeze(4)
+        emb = torch.stack([cosines, sines]).unsqueeze(-3)
+        return emb.repeat_interleave(2, dim=-1)
 
 
 class TokenConfidence(nn.Module):
@@ -62,23 +62,22 @@ class SelfBlock(nn.Module):
     def forward(self, x: torch.Tensor, encoding: torch.Tensor) -> torch.Tensor:
         b, n, _ = x.shape
         qkv: torch.Tensor = self.Wqkv(x)
-        qkv = qkv.reshape((b, n, self.embed_dim, 3))
+        qkv = qkv.reshape((b, n, self.num_heads, self.head_dim, 3)).transpose(1, 2)
         qk, v = qkv[..., :2], qkv[..., 2]
         qk = self.apply_cached_rotary_emb(encoding, qk)
         q, k = qk[..., 0], qk[..., 1]
-        context = multi_head_attention_dispatch(q, k, v, self.num_heads)
+        q, k, v = (tensor.transpose(1, 2).reshape(b, n, self.embed_dim) for tensor in (q, k, v))
+        context = multi_head_attention(q, k, v, self.num_heads)
         message = self.out_proj(context)
         return x + self.ffn(torch.concat([x, message], 2))
 
     def rotate_half(self, qk: torch.Tensor) -> torch.Tensor:
-        b, n, _, _ = qk.shape
-        qk = qk.reshape((b, n, self.num_heads, self.head_dim // 2, 2, 2))
-        qk = torch.stack((-qk[..., 1, :], qk[..., 0, :]), dim=4)
-        qk = qk.reshape((b, n, self.embed_dim, 2))
-        return qk
+        qk = qk.unflatten(-2, (-1, 2))
+        qk = torch.stack((-qk[..., 1, :], qk[..., 0, :]), dim=-2)
+        return qk.flatten(-3, -2)
 
     def apply_cached_rotary_emb(self, encoding: torch.Tensor, qk: torch.Tensor) -> torch.Tensor:
-        return qk * encoding[0] + self.rotate_half(qk) * encoding[1]
+        return qk * encoding[0].unsqueeze(-1) + self.rotate_half(qk) * encoding[1].unsqueeze(-1)
 
 
 class CrossBlock(nn.Module):
@@ -102,12 +101,12 @@ class CrossBlock(nn.Module):
         )
 
     def forward(self, descriptors: torch.Tensor) -> torch.Tensor:
-        b, _, _ = descriptors.shape
         qk, v = self.to_qk(descriptors), self.to_v(descriptors)
 
-        indices = torch.arange(b, device=descriptors.device)
-        swap = (indices // 2) * 2 + (1 - indices % 2)  # swap trick
-        m = multi_head_attention_dispatch(qk, qk[swap], v[swap], self.num_heads)
+        point_count = descriptors.shape[1]
+        qk_swapped = qk.reshape(-1, 2, point_count, self.embed_dim).flip(1).flatten(0, 1)
+        v_swapped = v.reshape(-1, 2, point_count, self.embed_dim).flip(1).flatten(0, 1)
+        m = multi_head_attention(qk, qk_swapped, v_swapped, self.num_heads)
         m = self.to_out(m)
         descriptors = descriptors + self.ffn(torch.concat([descriptors, m], 2))
         return descriptors
