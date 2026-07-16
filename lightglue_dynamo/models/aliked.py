@@ -1,0 +1,231 @@
+# Descriptor implementation adapted from ALIKED (BSD-3-Clause).
+from pathlib import Path
+
+import torch
+import torch.nn.functional as F
+import torchvision
+from torch import nn
+
+
+def _get_patches(tensor: torch.Tensor, keypoints: torch.Tensor, size: int) -> torch.Tensor:
+    channels, height, width = tensor.shape
+    corners = (keypoints - size / 2 + 1).long()
+    x_corner = corners[:, 0].clamp(0, width - 1 - size)
+    y_corner = corners[:, 1].clamp(0, height - 1 - size)
+    offset = torch.arange(size, device=tensor.device)
+    y, x = torch.meshgrid(offset, offset, indexing="ij")
+    x = x[..., None] + x_corner
+    y = y[..., None] + y_corner
+    sampled = tensor[:, y, x].permute(3, 0, 1, 2)
+    return sampled.reshape(keypoints.shape[0], channels, size, size)
+
+
+class DeformableConv2d(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, *, portable: bool = False) -> None:
+        super().__init__()
+        self.portable = portable
+        self.offset_conv = nn.Conv2d(in_channels, 18, 3, padding=1)
+        self.regular_conv = nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False)
+
+    def forward(self, tensor: torch.Tensor) -> torch.Tensor:
+        maximum = max(tensor.shape[-2], tensor.shape[-1]) / 4.0
+        offsets = self.offset_conv(tensor).clamp(-maximum, maximum)
+        if self.portable:
+            return self._portable_deform_conv2d(tensor, offsets)
+        return torchvision.ops.deform_conv2d(
+            tensor, offsets, self.regular_conv.weight, self.regular_conv.bias, padding=(1, 1)
+        )
+
+    def _portable_deform_conv2d(self, tensor: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
+        """Decompose the 3x3 deformable convolution into standard GridSample operations.
+
+        TensorRT requires a separately distributed plugin for the standard ONNX
+        DeformConv node. This path is slower in eager PyTorch, but exports without
+        custom operators and keeps the normal torchvision implementation available.
+        """
+        _batch, _channels, height, width = tensor.shape
+        dtype = tensor.dtype
+        y_base, x_base = torch.meshgrid(
+            torch.arange(height, device=tensor.device, dtype=dtype),
+            torch.arange(width, device=tensor.device, dtype=dtype),
+            indexing="ij",
+        )
+        samples: list[torch.Tensor] = []
+        for kernel_index in range(9):
+            kernel_y, kernel_x = divmod(kernel_index, 3)
+            y = y_base + kernel_y - 1 + offsets[:, 2 * kernel_index]
+            x = x_base + kernel_x - 1 + offsets[:, 2 * kernel_index + 1]
+            grid_x = 2 * x / max(width - 1, 1) - 1
+            grid_y = 2 * y / max(height - 1, 1) - 1
+            grid = torch.stack((grid_x, grid_y), dim=-1)
+            samples.append(F.grid_sample(tensor, grid, mode="bilinear", align_corners=True))
+        sampled = torch.stack(samples, dim=1)
+        weight = self.regular_conv.weight.flatten(2)
+        output = torch.einsum("nkchw,ock->nohw", sampled, weight)
+        if self.regular_conv.bias is not None:
+            output = output + self.regular_conv.bias.reshape(1, -1, 1, 1)
+        return output
+
+
+class ConvBlock(nn.Module):
+    def __init__(
+        self, in_channels: int, out_channels: int, *, deformable: bool = False, portable: bool = False
+    ) -> None:
+        super().__init__()
+        conv = lambda source, target: (
+            DeformableConv2d(source, target, portable=portable)
+            if deformable
+            else nn.Conv2d(source, target, 3, padding=1, bias=False)
+        )
+        self.gate = nn.SELU(inplace=True)
+        self.conv1 = conv(in_channels, out_channels)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = conv(out_channels, out_channels)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+
+    def forward(self, tensor: torch.Tensor) -> torch.Tensor:
+        tensor = self.gate(self.bn1(self.conv1(tensor)))
+        return self.gate(self.bn2(self.conv2(tensor)))
+
+
+class ResBlock(nn.Module):
+    def __init__(
+        self, in_channels: int, out_channels: int, *, deformable: bool = False, portable: bool = False
+    ) -> None:
+        super().__init__()
+        conv = lambda source, target: (
+            DeformableConv2d(source, target, portable=portable)
+            if deformable
+            else nn.Conv2d(source, target, 3, padding=1, bias=False)
+        )
+        self.gate = nn.SELU(inplace=True)
+        self.conv1 = conv(in_channels, out_channels)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = conv(out_channels, out_channels)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.downsample = nn.Conv2d(in_channels, out_channels, 1)
+
+    def forward(self, tensor: torch.Tensor) -> torch.Tensor:
+        identity = self.downsample(tensor)
+        tensor = self.gate(self.bn1(self.conv1(tensor)))
+        tensor = self.bn2(self.conv2(tensor))
+        return self.gate(tensor + identity)
+
+
+class SparseDescriptorHead(nn.Module):
+    def __init__(self, dimensions: int = 128, kernel_size: int = 3, positions: int = 16) -> None:
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.positions = positions
+        self.offset_conv = nn.Sequential(
+            nn.Conv2d(dimensions, 2 * positions, kernel_size),
+            nn.SELU(inplace=True),
+            nn.Conv2d(2 * positions, 2 * positions, 1),
+        )
+        self.sf_conv = nn.Conv2d(dimensions, dimensions, 1, bias=False)
+        self.agg_weights = nn.Parameter(torch.rand(positions, dimensions, dimensions))
+
+    def forward(self, features: torch.Tensor, keypoints: torch.Tensor) -> torch.Tensor:
+        batch, channels, height, width = features.shape
+        scale = features.new_tensor([width - 1, height - 1])
+        descriptors: list[torch.Tensor] = []
+        for index in range(batch):
+            points = keypoints[index]
+            pixel_points = (points / 2 + 0.5) * scale
+            # ALIKED intentionally quantizes patch centers before estimating offsets.
+            patches = _get_patches(features[index], pixel_points.long(), self.kernel_size)
+            offsets = self.offset_conv(patches).clamp(-max(height, width) / 4.0, max(height, width) / 4.0)
+            offsets = offsets[:, :, 0, 0].reshape(points.shape[0], 2, self.positions).transpose(1, 2)
+            positions = pixel_points[:, None] + offsets
+            positions = (2 * positions / scale - 1).reshape(1, -1, 1, 2)
+            sampled = F.grid_sample(features[index : index + 1], positions, mode="bilinear", align_corners=True)
+            sampled = sampled.reshape(channels, points.shape[0], self.positions, 1).permute(1, 0, 2, 3)
+            sampled = F.selu(self.sf_conv(sampled)).squeeze(-1)
+            descriptor = torch.einsum("ncp,pcd->nd", sampled, self.agg_weights)
+            descriptors.append(F.normalize(descriptor, p=2, dim=1))
+        return torch.stack(descriptors)
+
+
+class ALIKEDDescriptor(nn.Module):
+    weights_url = "https://github.com/Shiaoming/ALIKED/raw/main/models/aliked-n16.pth"
+
+    def __init__(self, weights: str | Path | None = weights_url, *, portable_deform_conv: bool = False) -> None:
+        super().__init__()
+        self.pool2 = nn.AvgPool2d(2, 2)
+        self.pool4 = nn.AvgPool2d(4, 4)
+        self.gate = nn.SELU(inplace=True)
+        self.block1 = ConvBlock(3, 16)
+        self.block2 = ResBlock(16, 32)
+        self.block3 = ResBlock(32, 64, deformable=True, portable=portable_deform_conv)
+        self.block4 = ResBlock(64, 128, deformable=True, portable=portable_deform_conv)
+        self.conv1 = nn.Conv2d(16, 32, 1, bias=False)
+        self.conv2 = nn.Conv2d(32, 32, 1, bias=False)
+        self.conv3 = nn.Conv2d(64, 32, 1, bias=False)
+        self.conv4 = nn.Conv2d(128, 32, 1, bias=False)
+        self.desc_head = SparseDescriptorHead()
+        if weights is not None:
+            self._load_weights(weights)
+
+    def _load_weights(self, weights: str | Path) -> None:
+        if isinstance(weights, str) and weights.startswith(("http://", "https://")):
+            state = torch.hub.load_state_dict_from_url(weights, map_location="cpu", weights_only=True)
+        else:
+            state = torch.load(weights, map_location="cpu", weights_only=True)
+        filtered = {key: value for key, value in state.items() if not key.startswith("score_head.")}
+        self.load_state_dict(filtered, strict=True)
+
+    def _dense_features(self, image: torch.Tensor) -> torch.Tensor:
+        x1 = self.block1(image)
+        x2 = self.block2(self.pool2(x1))
+        x3 = self.block3(self.pool4(x2))
+        x4 = self.block4(self.pool4(x3))
+        features = torch.cat(
+            [
+                self.gate(self.conv1(x1)),
+                F.interpolate(self.gate(self.conv2(x2)), scale_factor=2, mode="bilinear", align_corners=True),
+                F.interpolate(self.gate(self.conv3(x3)), scale_factor=8, mode="bilinear", align_corners=True),
+                F.interpolate(self.gate(self.conv4(x4)), scale_factor=32, mode="bilinear", align_corners=True),
+            ],
+            dim=1,
+        )
+        return F.normalize(features, p=2, dim=1)
+
+    def forward(self, image: torch.Tensor, keypoints: torch.Tensor) -> torch.Tensor:
+        scale = image.new_tensor([image.shape[-1] - 1, image.shape[-2] - 1])
+        normalized_keypoints = 2 * keypoints / scale - 1
+        return self.desc_head(self._dense_features(image), normalized_keypoints)
+
+
+class RaCoALIKED(nn.Module):
+    normalize_by_long_edge = True
+
+    def __init__(
+        self,
+        num_keypoints: int = 2048,
+        raco_weights: str | Path | None = None,
+        aliked_weights: str | Path | None = None,
+        nms_radius: int = 3,
+        subpixel_sampling: bool = True,
+        subpixel_temperature: float = 0.5,
+        sort_by_ranker: bool = True,
+        portable_deform_conv: bool = False,
+    ) -> None:
+        super().__init__()
+        from .raco import RaCo
+
+        self.raco = RaCo(
+            num_keypoints=num_keypoints,
+            nms_radius=nms_radius,
+            subpixel_sampling=subpixel_sampling,
+            subpixel_temperature=subpixel_temperature,
+            sort_by_ranker=sort_by_ranker,
+            weights=raco_weights or RaCo.weights_url,
+        )
+        self.aliked = ALIKEDDescriptor(
+            weights=aliked_weights or ALIKEDDescriptor.weights_url, portable_deform_conv=portable_deform_conv
+        )
+
+    def forward(self, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        keypoints, detection_scores, ranker_scores = self.raco(image)
+        descriptors = self.aliked(image, keypoints)
+        return keypoints, detection_scores, descriptors, ranker_scores

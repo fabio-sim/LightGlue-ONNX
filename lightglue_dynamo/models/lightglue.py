@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -179,7 +181,7 @@ class LightGlue(nn.Module):
 
     def __init__(
         self,
-        url: str,
+        url: str | Path,
         input_dim: int = 256,
         descriptor_dim: int = 256,
         num_heads: int = 4,
@@ -213,7 +215,10 @@ class LightGlue(nn.Module):
         self.token_confidence = nn.ModuleList([TokenConfidence(d) for _ in range(n - 1)])
         self.register_buffer("confidence_thresholds", torch.Tensor([self.confidence_threshold(i) for i in range(n)]))
 
-        state_dict = torch.hub.load_state_dict_from_url(url)
+        if isinstance(url, str) and url.startswith(("http://", "https://")):
+            state_dict = torch.hub.load_state_dict_from_url(url, map_location="cpu", weights_only=True)
+        else:
+            state_dict = torch.load(url, map_location="cpu", weights_only=True)
 
         # rename old state dict entries
         for i in range(n):
@@ -241,6 +246,36 @@ class LightGlue(nn.Module):
         scores = self.log_assignment[i](descriptors)  # (B, N, N)
         matches, mscores = filter_matches(scores, self.filter_threshold)
         return matches, mscores  # (M, 3), (M,)
+
+    @torch.inference_mode()
+    def forward_adaptive_depth(
+        self, keypoints: torch.Tensor, descriptors: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """Run host-orchestrated early stopping and report the executed layer count.
+
+        The scalar stop decision is copied to the host after each stage. This is
+        genuinely work-reducing in eager PyTorch, but it is intentionally kept out
+        of ``forward`` because ONNX and TensorRT exports remain fixed-depth graphs.
+        """
+        if not 0 < self.depth_confidence < 1:
+            raise ValueError("adaptive depth requires depth_confidence between 0 and 1")
+        descriptors = self.input_proj(descriptors)
+        encodings = self.posenc(keypoints)
+        executed_layers = self.n_layers
+        for layer_index in range(self.n_layers):
+            descriptors = self.transformers[layer_index](descriptors, encodings)
+            if layer_index == self.n_layers - 1:
+                continue
+            confidence0, confidence1 = self.token_confidence[layer_index](descriptors[0::2], descriptors[1::2])
+            num_points = confidence0.shape[-1] + confidence1.shape[-1]
+            should_stop = self.check_if_stop(confidence0, confidence1, layer_index, num_points)
+            if bool(should_stop.item()):
+                executed_layers = layer_index + 1
+                break
+
+        scores = self.log_assignment[executed_layers - 1](descriptors)
+        matches, mscores = filter_matches(scores, self.filter_threshold)
+        return matches, mscores, executed_layers
 
     def confidence_threshold(self, layer_index: int) -> float:
         """scaled confidence threshold"""

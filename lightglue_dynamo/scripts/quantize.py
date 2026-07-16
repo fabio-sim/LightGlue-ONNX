@@ -1,11 +1,11 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#     "nvidia-modelopt[all]==0.40.0",
-#     "numpy==2.2.6",
-#     "opencv-python==4.12.0.88",
-#     "tensorrt==10.9.0.34",
-#     "typer==0.21.0",
+#     "nvidia-modelopt[onnx]==0.45.0",
+#     "numpy==2.5.1",
+#     "opencv-python==5.0.0.93",
+#     "tensorrt-cu12==10.16.1.11",
+#     "typer==0.27.0",
 # ]
 # ///
 
@@ -50,6 +50,12 @@ def _preprocess_disk(images: np.ndarray) -> np.ndarray:
     return images.transpose(*axes)
 
 
+def _preprocess_raco(images: np.ndarray) -> np.ndarray:
+    images = images[..., ::-1].astype(np.float32) / np.float32(255)
+    axes = [*list(range(images.ndim - 3)), -1, -3, -2]
+    return images.transpose(*axes)
+
+
 def _build_calibration_data(
     extractor: str, image_paths: list[Path], height: int, width: int, max_pairs: int
 ) -> np.ndarray:
@@ -68,7 +74,12 @@ def _build_calibration_data(
         left = _load_and_resize(image_paths[idx], width, height)
         right = _load_and_resize(image_paths[idx + 1], width, height)
         raw = np.stack([left, right])
-        processed = _preprocess_superpoint(raw) if extractor == "superpoint" else _preprocess_disk(raw)
+        if extractor == "superpoint":
+            processed = _preprocess_superpoint(raw)
+        elif extractor == "raco_aliked":
+            processed = _preprocess_raco(raw)
+        else:
+            processed = _preprocess_disk(raw)
         if processed.shape[1:] != calibration_data.shape[1:]:
             raise ValueError(
                 "Processed calibration data shape does not match expected input shape: "
@@ -114,7 +125,8 @@ def main(
         Path, typer.Option("--output", dir_okay=False, writable=True, help="Path to save quantized ONNX model.")
     ],
     extractor: Annotated[
-        Literal["superpoint", "disk"], typer.Option("--extractor", help="Extractor type used to select preprocessing.")
+        Literal["superpoint", "disk", "raco_aliked"],
+        typer.Option("--extractor", help="Extractor type used to select preprocessing."),
     ],
     height: Annotated[int, typer.Option("--height", min=1, help="Resize height for calibration images.")] = 1024,
     width: Annotated[int, typer.Option("--width", min=1, help="Resize width for calibration images.")] = 1024,

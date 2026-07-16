@@ -1,0 +1,11 @@
+:root { color-scheme: dark; font-family: ui-sans-serif, system-ui, sans-serif; }
+body { margin: 0; background: #11151b; color: #e9eef5; }
+main { width: min(1100px, calc(100% - 2rem)); margin: 2rem auto; }
+h1 { margin-bottom: 0.25rem; }
+.controls { display: flex; flex-wrap: wrap; gap: 0.8rem; align-items: end; margin: 1.5rem 0; }
+label { display: grid; gap: 0.35rem; font-size: 0.85rem; color: #afbdcc; }
+input, select, button { color: inherit; background: #202833; border: 1px solid #3b495a; border-radius: 0.4rem; padding: 0.55rem; }
+button { cursor: pointer; background: #176b4d; }
+button:disabled { opacity: 0.55; }
+pre { overflow: auto; padding: 1rem; background: #090c10; border-radius: 0.5rem; }
+canvas { display: block; max-width: 100%; height: auto; background: #090c10; }

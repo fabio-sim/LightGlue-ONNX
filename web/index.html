@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>RaCo + LightGlue+ WebGPU</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <main>
+      <h1>RaCo + ALIKED + LightGlue+</h1>
+      <p>ONNX Runtime Web with WebGPU and a WebAssembly fallback. Covariance is not part of the model.</p>
+      <section class="controls">
+        <label>ONNX model <input id="model" type="file" accept=".onnx" /></label>
+        <label>Left image <input id="left" type="file" accept="image/*" /></label>
+        <label>Right image <input id="right" type="file" accept="image/*" /></label>
+        <label>Power preference
+          <select id="power">
+            <option value="default">default</option>
+            <option value="low-power">low-power</option>
+            <option value="high-performance">high-performance</option>
+          </select>
+        </label>
+        <label>Warmups <input id="warmup" type="number" min="0" value="3" /></label>
+        <label>Runs <input id="runs" type="number" min="1" value="20" /></label>
+        <button id="run">Load and benchmark</button>
+      </section>
+      <pre id="status">Select a static-shape RaCo ONNX model and two images.</pre>
+      <canvas id="matches"></canvas>
+    </main>
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/ort.webgpu.min.js"></script>
+    <script type="module" src="main.js"></script>
+  </body>
+</html>

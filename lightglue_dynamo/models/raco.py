@@ -1,0 +1,166 @@
+from pathlib import Path
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+
+
+class ConvBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int) -> None:
+        super().__init__()
+        self.gate = nn.SELU(inplace=True)
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+
+    def forward(self, tensor: torch.Tensor) -> torch.Tensor:
+        tensor = self.gate(self.bn1(self.conv1(tensor)))
+        return self.gate(self.bn2(self.conv2(tensor)))
+
+
+class ResBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int) -> None:
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.gate = nn.SELU(inplace=True)
+        self.match_dims = nn.Conv2d(in_channels, out_channels, 1)
+
+    def forward(self, tensor: torch.Tensor) -> torch.Tensor:
+        identity = self.match_dims(tensor)
+        tensor = self.gate(self.bn1(self.conv1(tensor)))
+        tensor = self.bn2(self.conv2(tensor))
+        return self.gate(tensor + identity)
+
+
+def _conv1x1(in_channels: int, out_channels: int) -> nn.Conv2d:
+    return nn.Conv2d(in_channels, out_channels, 1, bias=False)
+
+
+def _conv3x3(in_channels: int, out_channels: int) -> nn.Conv2d:
+    return nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False)
+
+
+def _subpixel_offsets(logits: torch.Tensor, indices: torch.Tensor, nms_radius: int, temperature: float) -> torch.Tensor:
+    batch, _, _, _ = logits.shape
+    patches = F.unfold(logits, kernel_size=nms_radius, padding=nms_radius // 2)
+    patches = patches.gather(2, indices[:, None].expand(batch, nms_radius**2, -1))
+    probabilities = F.softmax(patches / temperature, dim=1)
+    coordinates = torch.linspace(-(nms_radius - 1) / 2, (nms_radius - 1) / 2, nms_radius, device=logits.device)
+    y, x = torch.meshgrid(coordinates, coordinates, indexing="ij")
+    offsets = torch.stack((x, y), dim=-1).reshape(nms_radius**2, 2)
+    return torch.einsum("bkn,kd->bnd", probabilities, offsets)
+
+
+def _sample(feature_map: torch.Tensor, keypoints: torch.Tensor) -> torch.Tensor:
+    height, width = feature_map.shape[-2:]
+    scale = keypoints.new_tensor([width - 1, height - 1])
+    grid = (2 * keypoints / scale - 1).unsqueeze(2)
+    sampled = F.grid_sample(feature_map, grid, mode="bilinear", padding_mode="border", align_corners=True)
+    sampled = sampled.squeeze(-1).transpose(1, 2)
+    return sampled.squeeze(-1) if feature_map.shape[1] == 1 else sampled
+
+
+class RaCo(nn.Module):
+    weights_url = "https://github.com/cvg/RaCo/releases/download/v1.0.0/raco.pth"
+
+    def __init__(
+        self,
+        num_keypoints: int = 2048,
+        nms_radius: int = 3,
+        subpixel_sampling: bool = True,
+        subpixel_temperature: float = 0.5,
+        sort_by_ranker: bool = True,
+        weights: str | Path | None = weights_url,
+    ) -> None:
+        super().__init__()
+        if nms_radius % 2 == 0:
+            raise ValueError("nms_radius must be odd")
+        if num_keypoints <= 0:
+            raise ValueError("num_keypoints must be positive")
+        self.num_keypoints = num_keypoints
+        self.nms_radius = nms_radius
+        self.subpixel_sampling = subpixel_sampling
+        self.subpixel_temperature = subpixel_temperature
+        self.sort_by_ranker = sort_by_ranker
+        self.register_buffer("image_mean", torch.tensor([0.485, 0.456, 0.406])[None, :, None, None], persistent=False)
+        self.register_buffer("image_std", torch.tensor([0.229, 0.224, 0.225])[None, :, None, None], persistent=False)
+
+        self.pool2 = nn.AvgPool2d(2, 2)
+        self.pool4 = nn.AvgPool2d(4, 4)
+        self.gate = nn.SELU(inplace=True)
+        self.block1 = ConvBlock(3, 16)
+        self.block2 = ResBlock(16, 32)
+        self.block3 = ResBlock(32, 64)
+        self.block4 = ResBlock(64, 128)
+        self.conv1 = _conv1x1(16, 32)
+        self.conv2 = _conv3x3(32, 32)
+        self.conv3 = _conv3x3(64, 32)
+        self.conv4 = _conv3x3(128, 32)
+        self.score_head = nn.Sequential(
+            _conv1x1(128, 8),
+            nn.SELU(inplace=True),
+            _conv3x3(8, 4),
+            nn.SELU(inplace=True),
+            _conv3x3(4, 4),
+            nn.SELU(inplace=True),
+            _conv3x3(4, 1),
+        )
+        ranker_layers: list[nn.Module] = [ResBlock(3, 12)]
+        ranker_layers.extend(ResBlock(12, 12) for _ in range(8))
+        ranker_layers.append(nn.Conv2d(12, 1, 5, padding=2, padding_mode="reflect"))
+        self.ranker_head = nn.Sequential(*ranker_layers)
+
+        if weights is not None:
+            self._load_weights(weights)
+
+    def _load_weights(self, weights: str | Path) -> None:
+        if isinstance(weights, str) and weights.startswith(("http://", "https://")):
+            state = torch.hub.load_state_dict_from_url(weights, map_location="cpu", weights_only=True)
+        else:
+            state = torch.load(weights, map_location="cpu", weights_only=True)
+        covariance_keys = {key for key in state if key.startswith("covariance_estimator_head.")}
+        filtered = {key: value for key, value in state.items() if key not in covariance_keys}
+        self.load_state_dict(filtered, strict=True)
+        if len(covariance_keys) != 5:
+            raise RuntimeError(f"Expected five covariance-head tensors, found {len(covariance_keys)}")
+
+    def forward(self, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        image = (image - self.image_mean) / self.image_std
+
+        x1 = self.block1(image)
+        x2 = self.block2(self.pool2(x1))
+        x3 = self.block3(self.pool4(x2))
+        x4 = self.block4(self.pool4(x3))
+        features = torch.cat(
+            [
+                self.gate(self.conv1(x1)),
+                F.interpolate(self.gate(self.conv2(x2)), scale_factor=2, mode="bilinear", align_corners=True),
+                F.interpolate(self.gate(self.conv3(x3)), scale_factor=8, mode="bilinear", align_corners=True),
+                F.interpolate(self.gate(self.conv4(x4)), scale_factor=32, mode="bilinear", align_corners=True),
+            ],
+            dim=1,
+        )
+        logits = self.score_head(features)
+        ranker_map = self.ranker_head(image)
+        probabilities = F.softmax(logits.flatten(1), dim=1).reshape_as(logits)
+        nms = F.max_pool2d(probabilities, self.nms_radius, stride=1, padding=self.nms_radius // 2)
+        probabilities_nms = probabilities * (probabilities == nms)
+        top = probabilities_nms.flatten(1).topk(self.num_keypoints)
+        width = probabilities.shape[-1]
+        keypoints = torch.stack((top.indices % width, top.indices // width), dim=-1).to(probabilities.dtype)
+        if self.subpixel_sampling:
+            keypoints = keypoints + _subpixel_offsets(logits, top.indices, self.nms_radius, self.subpixel_temperature)
+        detection_scores = _sample(probabilities, keypoints)
+        ranker_scores = _sample(ranker_map, keypoints)
+        keypoints = keypoints + 0.5
+
+        if self.sort_by_ranker:
+            order = ranker_scores.argsort(dim=1, descending=True)
+            keypoints = keypoints.gather(1, order[..., None].expand(-1, -1, 2))
+            detection_scores = detection_scores.gather(1, order)
+            ranker_scores = ranker_scores.gather(1, order)
+        return keypoints, detection_scores, ranker_scores

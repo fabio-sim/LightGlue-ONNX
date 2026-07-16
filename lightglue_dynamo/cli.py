@@ -4,7 +4,7 @@ from typing import Annotated, cast
 import cv2
 import typer
 
-from lightglue_dynamo.cli_utils import check_multiple_of
+from lightglue_dynamo.cli_utils import check_multiple_of, preload_nvidia_libraries
 from lightglue_dynamo.config import Extractor, InferenceDevice
 
 app = typer.Typer()
@@ -49,8 +49,15 @@ def export(
         typer.Option(
             "--dynamo-export/--legacy-export", help="Use the TorchDynamo ONNX exporter. Legacy export uses TorchScript."
         ),
-    ] = False,
-    opset: Annotated[int, typer.Option(min=16, max=20, help="ONNX opset version of exported model.")] = 18,
+    ] = True,
+    opset: Annotated[int, typer.Option(min=16, max=20, help="ONNX opset version of exported model.")] = 20,
+    portable_deform_conv: Annotated[
+        bool,
+        typer.Option(
+            "--portable-deform-conv/--onnx-deform-conv",
+            help="Decompose ALIKED DeformConv for TensorRT and WebGPU portability.",
+        ),
+    ] = True,
     fp16: Annotated[bool, typer.Option("--fp16", help="Whether to also convert to FP16.")] = False,
 ) -> None:
     """Export LightGlue to ONNX."""
@@ -59,7 +66,7 @@ def export(
     from onnxruntime.tools.symbolic_shape_infer import SymbolicShapeInference
     from onnxruntime.transformers.float16 import convert_float_to_float16
 
-    from lightglue_dynamo.models import DISK, LightGlue, Pipeline, SuperPoint
+    from lightglue_dynamo.models import DISK, LightGlue, Pipeline, RaCoALIKED, SuperPoint
     from lightglue_dynamo.ops import use_fused_multi_head_attention
 
     match extractor_type:
@@ -67,11 +74,22 @@ def export(
             extractor = SuperPoint(num_keypoints=num_keypoints)
         case Extractor.disk:
             extractor = DISK(num_keypoints=num_keypoints)
+        case Extractor.raco_aliked:
+            if opset < 20:
+                raise typer.BadParameter("raco_aliked export requires ONNX opset 20.")
+            if batch_size == 0 or height == 0 or width == 0:
+                raise typer.BadParameter(
+                    "raco_aliked currently requires a static batch, height, and width; "
+                    "the current PyTorch exporter cannot preserve its dynamic top-k and descriptor sampling."
+                )
+            extractor = RaCoALIKED(num_keypoints=num_keypoints, portable_deform_conv=portable_deform_conv)
     matcher = LightGlue(**extractor_type.lightglue_config)
     pipeline = Pipeline(extractor, matcher).eval()
 
     if output is None:
         output = Path(f"weights/{extractor_type}_lightglue_pipeline.onnx")
+
+    output_names = ["keypoints", "matches", "mscores"]
 
     check_multiple_of(batch_size, 2)
     check_multiple_of(height, extractor_type.input_dim_divisor)
@@ -129,7 +147,7 @@ def export(
             inputs,
             str(output),
             input_names=["images"],
-            output_names=["keypoints", "matches", "mscores"],
+            output_names=output_names,
             opset_version=opset,
             dynamic_axes=dynamic_axes,
             dynamic_shapes=dynamic_shapes,
@@ -141,7 +159,7 @@ def export(
         export_model(use_dynamo)
         onnx.checker.check_model(output)
     except Exception as exc:
-        if not use_dynamo:
+        if not use_dynamo or extractor_type == Extractor.raco_aliked:
             raise
         typer.echo(
             f"Warning: Dynamo exporter failed ({exc}). Falling back to legacy exporter. "
@@ -198,10 +216,15 @@ def infer(
     import time
 
     import numpy as np
+
+    # A GPU wheel can still be used with the CPU EP; preload is harmless for a
+    # CPU-only wheel and avoids failing the ORT import in a mixed environment.
+    preload_nvidia_libraries(tensorrt=device == InferenceDevice.tensorrt)
+
     import onnxruntime as ort
 
     from lightglue_dynamo import viz
-    from lightglue_dynamo.preprocessors import DISKPreprocessor, SuperPointPreprocessor
+    from lightglue_dynamo.preprocessors import DISKPreprocessor, RaCoPreprocessor, SuperPointPreprocessor
 
     def _load_and_resize(path: Path) -> np.ndarray:
         image = cv2.imread(str(path))
@@ -216,6 +239,8 @@ def infer(
             images = SuperPointPreprocessor.preprocess(images)
         case Extractor.disk:
             images = DISKPreprocessor.preprocess(images)
+        case Extractor.raco_aliked:
+            images = RaCoPreprocessor.preprocess(images)
     images = images.astype(np.float16 if fp16 and device != InferenceDevice.tensorrt else np.float32)
 
     if device in {InferenceDevice.cuda, InferenceDevice.tensorrt}:
@@ -287,7 +312,7 @@ def infer(
         outputs = cast(list[np.ndarray], session.run(None, {"images": images}))
         if profile:
             last_inference_time = time.perf_counter() - start
-        keypoints, matches, _mscores = outputs[0], outputs[1], outputs[2]
+        keypoints, matches, _mscores = outputs
 
     match_count = int(matches.shape[0])
     typer.echo(f"Matches: {match_count}")
@@ -343,6 +368,8 @@ def trtexec(
     """Run pure TensorRT inference for LightGlue model using Polygraphy (requires TensorRT to be installed)."""
     import site
 
+    preload_nvidia_libraries(tensorrt=True)
+
     import numpy as np
     from polygraphy.backend.common import BytesFromPath
     from polygraphy.backend.trt import (
@@ -355,7 +382,7 @@ def trtexec(
     )
 
     from lightglue_dynamo import viz
-    from lightglue_dynamo.preprocessors import DISKPreprocessor, SuperPointPreprocessor
+    from lightglue_dynamo.preprocessors import DISKPreprocessor, RaCoPreprocessor, SuperPointPreprocessor
 
     def _load_and_resize(path: Path) -> np.ndarray:
         image = cv2.imread(str(path))
@@ -370,6 +397,8 @@ def trtexec(
             images = SuperPointPreprocessor.preprocess(images)
         case Extractor.disk:
             images = DISKPreprocessor.preprocess(images)
+        case Extractor.raco_aliked:
+            images = RaCoPreprocessor.preprocess(images)
     images = images.astype(np.float32)
 
     if strongly_typed and precision_constraints.lower() != "none":
@@ -397,11 +426,14 @@ def trtexec(
         for path in site_paths:
             base = Path(path)
             trt_libs = base / "tensorrt_libs"
-            cuda_runtime = base / "nvidia" / "cuda_runtime" / "lib"
+            cuda_runtime = base / "nvidia" / "cu13" / "lib"
+            legacy_cuda_runtime = base / "nvidia" / "cuda_runtime" / "lib"
             if trt_libs.exists():
                 candidates.append(trt_libs)
             if cuda_runtime.exists():
                 candidates.append(cuda_runtime)
+            if legacy_cuda_runtime.exists():
+                candidates.append(legacy_cuda_runtime)
         if candidates:
             joined = ":".join(str(path) for path in candidates)
             typer.echo("Hint: add TensorRT + CUDA runtime libs to LD_LIBRARY_PATH, e.g.:")

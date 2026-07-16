@@ -48,16 +48,22 @@ Inference-only (default):
 uv sync
 ```
 
-Export support (adds PyTorch + ONNX):
+CPU export support (adds PyTorch, torchvision, ONNX, and ONNX Script):
 
 ```shell
-uv sync --group export
+uv sync --group export --extra torch-cpu
+```
+
+CUDA export and inference support (Linux x86-64):
+
+```shell
+uv sync --no-group cpu --group cuda --group export --extra torch-cuda
 ```
 
 TensorRT CLI support:
 
 ```shell
-uv sync --group trt
+uv sync --no-group cpu --group cuda --group export --group trt --extra torch-cuda
 ```
 
 ```shell
@@ -82,8 +88,10 @@ The ONNX Runtime CUDA and TensorRT execution providers require compatible CUDA a
 If you install CUDA/TensorRT runtime libraries via PyPI (e.g. `onnxruntime-gpu[cuda,cudnn]` and `tensorrt`), you may need to add the venv paths to `LD_LIBRARY_PATH` so Polygraphy and the TensorRT EP can find `libcudart.so` and `libnvinfer.so`:
 
 ```shell
-export LD_LIBRARY_PATH="$PWD/.venv/lib/python3.12/site-packages/tensorrt_libs:$PWD/.venv/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="$PWD/.venv/lib/python3.12/site-packages/tensorrt_libs:$PWD/.venv/lib/python3.12/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH:-}"
 ```
+
+The CLI will preload these wheel-provided libraries automatically, however, the environment variable remains useful for third-party tools launched outside the CLI.
 
 ## 📖 Example Commands
 
@@ -184,6 +192,16 @@ uv run lightglue-onnx infer \
   -d openvino
 </pre>
 </details>
+
+## Browser WebGPU demo
+
+Serve the static demo and open `http://localhost:8000` in a current Chromium browser:
+
+```shell
+uvx static-http --directory web --port 8000 --localhost-only
+```
+
+Select an exported static model and two images. The demo visualizes matches, reports adapter information when available, benchmarks steady-state execution, offers power-preference selection, and falls back to WebAssembly when WebGPU is unavailable.
 
 ## Credits
 If you use any ideas from the papers or code in this repo, please consider citing the authors of [LightGlue](https://arxiv.org/abs/2306.13643) and [SuperPoint](https://arxiv.org/abs/1712.07629) and [DISK](https://arxiv.org/abs/2006.13566). Lastly, if the ONNX versions helped you in any way, please also consider starring this repository.

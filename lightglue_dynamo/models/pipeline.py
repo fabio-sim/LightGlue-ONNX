@@ -14,10 +14,13 @@ class Pipeline(torch.nn.Module):
         h = shape[-2]
         w = shape[-1]
         # Extract keypoints and features
-        keypoints, _scores, descriptors = self.extractor(images)
+        keypoints, _scores, descriptors, *_metadata = self.extractor(images)
         # Normalize keypoints
         size = torch.stack([w, h]).to(device=keypoints.device, dtype=keypoints.dtype)
-        normalized_keypoints = 2 * keypoints / size - 1
+        if getattr(self.extractor, "normalize_by_long_edge", False):
+            normalized_keypoints = (keypoints - size / 2) / (size.max() / 2)
+        else:
+            normalized_keypoints = 2 * keypoints / size - 1
         # Match keypoints
         matches, mscores = self.matcher(normalized_keypoints, descriptors)
         return keypoints, matches, mscores
