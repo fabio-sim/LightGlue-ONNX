@@ -52,6 +52,7 @@ def export(
     import onnx
     import torch
     from onnxruntime.transformers.float16 import convert_float_to_float16
+    from onnxscript import opset20 as onnx_op
 
     from lightglue_dynamo.models import DISK, LightGlue, Pipeline, RaCoALIKED, SuperPoint
 
@@ -97,6 +98,15 @@ def export(
         return (image_shapes,) if image_shapes else None
 
     def export_model() -> None:
+        def translate_integer_div(self: object, other: object, rounding_mode: str | None = None) -> object:
+            if rounding_mode not in {"floor", "trunc"}:
+                raise ValueError(f"Unsupported integer division mode: {rounding_mode}")
+            # The default ONNX decomposition casts the quotient through float. TensorRT
+            # then lowers that cast to FP16, overflowing flattened image indices above
+            # 65504. These operands are non-negative integers, so ONNX integer Div is
+            # exactly equivalent to both supported rounding modes without a float cast.
+            return onnx_op.Div(self, other)
+
         example_batch = batch_size or 4
         divisor = extractor_type.input_dim_divisor
         dynamic_side = max(2 * divisor, ceil(sqrt(num_keypoints) / divisor) * divisor)
@@ -120,6 +130,7 @@ def export(
             dynamo=True,
             external_data=False,
             optimize=False,
+            custom_translation_table={torch.ops.aten.div.Tensor_mode: translate_integer_div},
         )
 
     export_model()

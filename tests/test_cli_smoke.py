@@ -28,6 +28,8 @@ def test_export_only_exposes_dynamo_exporter() -> None:
 
 
 def test_export_and_infer_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import onnx
+
     _patch_weights(monkeypatch)
 
     runner = CliRunner()
@@ -42,6 +44,8 @@ def test_export_and_infer_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     assert result.exit_code == 0, result.output
     assert model_path.exists()
     assert not model_path.with_suffix(model_path.suffix + ".data").exists()
+    graph = onnx.load(model_path).graph
+    assert all(node.op_type != "Floor" for node in graph.node)
 
     result = runner.invoke(
         app,
