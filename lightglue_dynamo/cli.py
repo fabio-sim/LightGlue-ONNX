@@ -77,22 +77,25 @@ def export(
     check_multiple_of(height, extractor_type.input_dim_divisor)
     check_multiple_of(width, extractor_type.input_dim_divisor)
 
-    if height > 0 and width > 0 and num_keypoints > height * width:
-        raise typer.BadParameter("num_keypoints cannot be greater than height * width.")
+    num_candidates = num_keypoints * extractor_type.keypoint_candidate_multiplier
+    if height > 0 and width > 0 and num_candidates > height * width:
+        raise typer.BadParameter(
+            f"The extractor requires {num_candidates} candidate locations, more than the {height * width} pixels."
+        )
 
     def build_dynamic_shapes() -> tuple[dict[int, object], ...] | None:
         image_shapes: dict[int, object] = {}
         divisor = extractor_type.input_dim_divisor
-        square_factor = max(2, ceil(sqrt(num_keypoints) / divisor))
+        square_factor = max(2, ceil(sqrt(num_candidates) / divisor))
         if batch_size == 0:
             pair_count = torch.export.Dim("pair_count", min=1)
             image_shapes[0] = 2 * pair_count
         if height == 0:
-            minimum_height_factor = max(2, ceil(num_keypoints / width / divisor)) if width else square_factor
+            minimum_height_factor = max(2, ceil(num_candidates / width / divisor)) if width else square_factor
             height_factor = torch.export.Dim("height_factor", min=minimum_height_factor)
             image_shapes[2] = divisor * height_factor
         if width == 0:
-            minimum_width_factor = max(2, ceil(num_keypoints / height / divisor)) if height else square_factor
+            minimum_width_factor = max(2, ceil(num_candidates / height / divisor)) if height else square_factor
             width_factor = torch.export.Dim("width_factor", min=minimum_width_factor)
             image_shapes[3] = divisor * width_factor
         return (image_shapes,) if image_shapes else None
@@ -109,13 +112,13 @@ def export(
 
         example_batch = batch_size or 4
         divisor = extractor_type.input_dim_divisor
-        dynamic_side = max(2 * divisor, ceil(sqrt(num_keypoints) / divisor) * divisor)
+        dynamic_side = max(2 * divisor, ceil(sqrt(num_candidates) / divisor) * divisor)
         if height == 0 and width > 0:
-            example_height = max(2 * divisor, ceil(num_keypoints / width / divisor) * divisor)
+            example_height = max(2 * divisor, ceil(num_candidates / width / divisor) * divisor)
         else:
             example_height = height or dynamic_side
         if width == 0 and height > 0:
-            example_width = max(2 * divisor, ceil(num_keypoints / height / divisor) * divisor)
+            example_width = max(2 * divisor, ceil(num_candidates / height / divisor) * divisor)
         else:
             example_width = width or dynamic_side
         inputs = (torch.zeros(example_batch, extractor_type.input_channels, example_height, example_width),)

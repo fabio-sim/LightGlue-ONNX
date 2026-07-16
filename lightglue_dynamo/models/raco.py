@@ -72,6 +72,7 @@ class RaCo(nn.Module):
     def __init__(
         self,
         num_keypoints: int = 2048,
+        candidate_multiplier: int = 2,
         nms_radius: int = 3,
         subpixel_sampling: bool = True,
         subpixel_temperature: float = 0.5,
@@ -83,7 +84,14 @@ class RaCo(nn.Module):
             raise ValueError("nms_radius must be odd")
         if num_keypoints <= 0:
             raise ValueError("num_keypoints must be positive")
+        if candidate_multiplier <= 0:
+            raise ValueError("candidate_multiplier must be positive")
         self.num_keypoints = num_keypoints
+        # Rank a larger detector-selected pool, then retain only the requested
+        # number of points. A 2x pool follows RaCo's 2048-candidate regime for
+        # the common 1024-point setting without increasing descriptor or matcher
+        # work. There is no benefit to over-extraction when ranking is disabled.
+        self.num_candidates = num_keypoints * candidate_multiplier if sort_by_ranker else num_keypoints
         self.nms_radius = nms_radius
         self.subpixel_sampling = subpixel_sampling
         self.subpixel_temperature = subpixel_temperature
@@ -151,7 +159,7 @@ class RaCo(nn.Module):
         probabilities = F.softmax(logits.flatten(1), dim=1).reshape_as(logits)
         nms = F.max_pool2d(probabilities, self.nms_radius, stride=1, padding=self.nms_radius // 2)
         probabilities_nms = probabilities * (probabilities == nms)
-        top = probabilities_nms.flatten(1).topk(self.num_keypoints)
+        top = probabilities_nms.flatten(1).topk(self.num_candidates)
         width = shape_as_tensor(probabilities)[-1]
         x = torch.remainder(top.indices, width)
         y = torch.div(top.indices, width, rounding_mode="floor")
@@ -167,4 +175,8 @@ class RaCo(nn.Module):
             keypoints = keypoints.gather(1, order[..., None].expand(-1, -1, 2))
             detection_scores = detection_scores.gather(1, order)
             ranker_scores = ranker_scores.gather(1, order)
-        return keypoints, detection_scores, ranker_scores
+        return (
+            keypoints[:, : self.num_keypoints],
+            detection_scores[:, : self.num_keypoints],
+            ranker_scores[:, : self.num_keypoints],
+        )

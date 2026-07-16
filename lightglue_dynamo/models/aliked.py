@@ -208,6 +208,7 @@ class RaCoALIKED(nn.Module):
     def __init__(
         self,
         num_keypoints: int = 2048,
+        candidate_multiplier: int = 2,
         raco_weights: str | Path | None = None,
         aliked_weights: str | Path | None = None,
         nms_radius: int = 3,
@@ -221,6 +222,7 @@ class RaCoALIKED(nn.Module):
 
         self.raco = RaCo(
             num_keypoints=num_keypoints,
+            candidate_multiplier=candidate_multiplier,
             nms_radius=nms_radius,
             subpixel_sampling=subpixel_sampling,
             subpixel_temperature=subpixel_temperature,

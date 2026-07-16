@@ -43,6 +43,22 @@ def test_raco_checkpoint_filters_covariance_head(tmp_path: Path) -> None:
     assert all("covariance" not in name for name, _parameter in loaded.named_parameters())
 
 
+def test_raco_truncates_ranked_candidate_pool() -> None:
+    torch.manual_seed(0)
+    ranked_candidates = RaCo(num_keypoints=32, candidate_multiplier=1, weights=None).eval()
+    selected = RaCo(num_keypoints=16, candidate_multiplier=2, weights=None).eval()
+    selected.load_state_dict(ranked_candidates.state_dict())
+    images = torch.rand(2, 3, 64, 64)
+
+    with torch.inference_mode():
+        candidates = ranked_candidates(images)
+        outputs = selected(images)
+
+    assert selected.num_candidates == 32
+    for output, candidate in zip(outputs, candidates, strict=True):
+        torch.testing.assert_close(output, candidate[:, :16])
+
+
 def test_raco_preprocessor_is_rgb_float32() -> None:
     bgr = np.asarray([[[[0, 127, 255]]]], dtype=np.uint8)
     result = RaCoPreprocessor.preprocess(bgr)

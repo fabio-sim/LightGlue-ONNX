@@ -35,6 +35,11 @@ class Extractor(StrEnum):
                 return 3
 
     @property
+    def keypoint_candidate_multiplier(self) -> int:
+        """Detector candidates considered for each public output keypoint."""
+        return 2 if self is Extractor.raco_aliked else 1
+
+    @property
     def lightglue_config(self) -> dict[str, Any]:
         match self:
             case Extractor.superpoint:
