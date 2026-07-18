@@ -810,6 +810,7 @@ def _run_logged(command: list[str], log_path: Path) -> subprocess.CompletedProce
 def matrix(
     results_root: Annotated[Path, typer.Option(file_okay=False)] = Path("data/benchmark_results/matrix"),
     models_root: Annotated[Path, typer.Option(file_okay=False)] = Path("data/benchmark_models"),
+    cache_root: Annotated[Path, typer.Option(file_okay=False)] = Path("data/benchmark_cache"),
     backends: Annotated[
         str, typer.Option(help="Comma-separated pytorch,torch-compile,ort-cuda,ort-tensorrt,tensorrt list.")
     ] = "torch-compile,ort-cuda,ort-tensorrt",
@@ -932,6 +933,8 @@ def matrix(
                             str(warmup),
                             "--max-pairs",
                             str(max_pairs),
+                            "--cache-root",
+                            str(cache_root),
                         ]
                         if backend == "torch-compile" and compile_mode is not None:
                             command.extend(["--compile-mode", compile_mode])

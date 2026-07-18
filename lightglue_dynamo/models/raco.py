@@ -239,10 +239,10 @@ class RaCo(nn.Module):
         keypoints = keypoints + 0.5
 
         if self.sort_by_ranker:
-            order = ranker_scores.argsort(dim=1, descending=True)
+            ranker_scores, order = ranker_scores.topk(self.num_keypoints, dim=1)
             keypoints = keypoints.gather(1, order[..., None].expand(-1, -1, 2))
             detection_scores = detection_scores.gather(1, order)
-            ranker_scores = ranker_scores.gather(1, order)
+            return keypoints, detection_scores, ranker_scores
         return (
             keypoints[:, : self.num_keypoints],
             detection_scores[:, : self.num_keypoints],
