@@ -11,7 +11,7 @@ from ..ops.shape_utils import shape_as_tensor
 class ConvBlock(nn.Module):
     def __init__(self, in_channels: int, out_channels: int) -> None:
         super().__init__()
-        self.gate = nn.SELU(inplace=True)
+        self.gate = nn.SELU()
         self.conv1 = nn.Conv2d(in_channels, out_channels, 3, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(out_channels)
         self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False)
@@ -37,7 +37,7 @@ class ResBlock(nn.Module):
         self.bn1 = nn.BatchNorm2d(out_channels)
         self.conv2 = nn.Conv2d(out_channels, out_channels, 3, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(out_channels)
-        self.gate = nn.SELU(inplace=True)
+        self.gate = nn.SELU()
         self.match_dims = nn.Conv2d(in_channels, out_channels, 1)
 
     def forward(self, tensor: torch.Tensor) -> torch.Tensor:
@@ -154,7 +154,7 @@ class RaCo(nn.Module):
 
         self.pool2 = nn.AvgPool2d(2, 2)
         self.pool4 = nn.AvgPool2d(4, 4)
-        self.gate = nn.SELU(inplace=True)
+        self.gate = nn.SELU()
         self.block1 = ConvBlock(3, 16)
         self.block2 = ResBlock(16, 32)
         self.block3 = ResBlock(32, 64)
@@ -165,11 +165,11 @@ class RaCo(nn.Module):
         self.conv4 = _conv3x3(128, 32)
         self.score_head = nn.Sequential(
             _conv1x1(128, 8),
-            nn.SELU(inplace=True),
+            nn.SELU(),
             _conv3x3(8, 4),
-            nn.SELU(inplace=True),
+            nn.SELU(),
             _conv3x3(4, 4),
-            nn.SELU(inplace=True),
+            nn.SELU(),
             _conv3x3(4, 1),
         )
         ranker_layers: list[nn.Module] = [ResBlock(3, 12)]
@@ -217,18 +217,23 @@ class RaCo(nn.Module):
         )
         logits = self.score_head(features)
         ranker_map = self.ranker_head(image)
-        probabilities = F.softmax(logits.flatten(1), dim=1).reshape_as(logits)
-        nms = F.max_pool2d(probabilities, self.nms_radius, stride=1, padding=self.nms_radius // 2)
-        probabilities_nms = probabilities * (probabilities == nms)
+        # Spatial softmax is strictly monotonic, so local maxima and their
+        # ordering can be selected directly from logits. Keep probability
+        # computation after selection: standalone RaCo still returns detection
+        # scores, while the matching pipeline can dead-code-eliminate that
+        # otherwise unused full-resolution branch.
+        nms = F.max_pool2d(logits, self.nms_radius, stride=1, padding=self.nms_radius // 2)
+        logits_nms = torch.where(logits == nms, logits, -torch.inf)
         _top_values, top_indices = _chunked_topk(
-            probabilities_nms.flatten(1), self.num_candidates, self.topk_chunk_size
+            logits_nms.flatten(1), self.num_candidates, self.topk_chunk_size
         )
-        width = shape_as_tensor(probabilities)[-1]
+        width = shape_as_tensor(logits)[-1]
         x = torch.remainder(top_indices, width)
         y = torch.div(top_indices, width, rounding_mode="floor")
-        keypoints = torch.stack((x, y), dim=-1).to(probabilities.dtype)
+        keypoints = torch.stack((x, y), dim=-1).to(logits.dtype)
         if self.subpixel_sampling:
             keypoints = keypoints + _subpixel_offsets(logits, top_indices, self.nms_radius, self.subpixel_temperature)
+        probabilities = F.softmax(logits.flatten(1), dim=1).reshape_as(logits)
         detection_scores = _sample(probabilities, keypoints)
         ranker_scores = _sample(ranker_map, keypoints)
         keypoints = keypoints + 0.5

@@ -94,7 +94,7 @@ class ConvBlock(nn.Module):
             if deformable
             else nn.Conv2d(source, target, 3, padding=1, bias=False)
         )
-        self.gate = nn.SELU(inplace=True)
+        self.gate = nn.SELU()
         self.conv1 = conv(in_channels, out_channels)
         self.bn1 = nn.BatchNorm2d(out_channels)
         self.conv2 = conv(out_channels, out_channels)
@@ -123,7 +123,7 @@ class ResBlock(nn.Module):
             if deformable
             else nn.Conv2d(source, target, 3, padding=1, bias=False)
         )
-        self.gate = nn.SELU(inplace=True)
+        self.gate = nn.SELU()
         self.conv1 = conv(in_channels, out_channels)
         self.bn1 = nn.BatchNorm2d(out_channels)
         self.conv2 = conv(out_channels, out_channels)
@@ -152,7 +152,7 @@ class SparseDescriptorHead(nn.Module):
         self.positions = positions
         self.offset_conv = nn.Sequential(
             nn.Conv2d(dimensions, 2 * positions, kernel_size),
-            nn.SELU(inplace=True),
+            nn.SELU(),
             nn.Conv2d(2 * positions, 2 * positions, 1),
         )
         self.sf_conv = nn.Conv2d(dimensions, dimensions, 1, bias=False)
@@ -186,7 +186,7 @@ class ALIKEDDescriptor(nn.Module):
         super().__init__()
         self.pool2 = nn.AvgPool2d(2, 2)
         self.pool4 = nn.AvgPool2d(4, 4)
-        self.gate = nn.SELU(inplace=True)
+        self.gate = nn.SELU()
         self.block1 = ConvBlock(3, 16)
         self.block2 = ResBlock(16, 32)
         self.block3 = ResBlock(32, 64, deformable=True, portable=portable_deform_conv)

@@ -133,6 +133,21 @@ def test_chunked_topk_has_direct_fallback() -> None:
     torch.testing.assert_close(indices, expected.indices, atol=0, rtol=0)
 
 
+def test_logit_nms_matches_probability_nms() -> None:
+    torch.manual_seed(11)
+    logits = torch.randn(2, 1, 64, 96)
+    probabilities = torch.softmax(logits.flatten(1), dim=1).reshape_as(logits)
+    probability_maxima = torch.nn.functional.max_pool2d(probabilities, 3, stride=1, padding=1)
+    probability_scores = probabilities * (probabilities == probability_maxima)
+    expected = _chunked_topk(probability_scores.flatten(1), 128, 1024)[1]
+
+    logit_maxima = torch.nn.functional.max_pool2d(logits, 3, stride=1, padding=1)
+    logit_scores = torch.where(logits == logit_maxima, logits, -torch.inf)
+    actual = _chunked_topk(logit_scores.flatten(1), 128, 1024)[1]
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
 def test_raco_preprocessor_is_rgb_float32() -> None:
     bgr = np.asarray([[[[0, 127, 255]]]], dtype=np.uint8)
     result = RaCoPreprocessor.preprocess(bgr)
