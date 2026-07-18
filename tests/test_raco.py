@@ -59,6 +59,13 @@ def test_raco_truncates_ranked_candidate_pool() -> None:
         torch.testing.assert_close(output, candidate[:, :16])
 
 
+def test_raco_caps_candidates_without_reducing_output_count() -> None:
+    assert RaCo(num_keypoints=2048, weights=None).num_candidates == 3840
+    assert RaCo(num_keypoints=4096, weights=None).num_candidates == 4096
+    assert Extractor.raco_aliked.keypoint_candidate_count(2048) == 3840
+    assert Extractor.raco_aliked.keypoint_candidate_count(4096) == 4096
+
+
 def test_raco_preprocessor_is_rgb_float32() -> None:
     bgr = np.asarray([[[[0, 127, 255]]]], dtype=np.uint8)
     result = RaCoPreprocessor.preprocess(bgr)

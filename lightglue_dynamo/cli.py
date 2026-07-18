@@ -77,7 +77,7 @@ def export(
     check_multiple_of(height, extractor_type.input_dim_divisor)
     check_multiple_of(width, extractor_type.input_dim_divisor)
 
-    num_candidates = num_keypoints * extractor_type.keypoint_candidate_multiplier
+    num_candidates = extractor_type.keypoint_candidate_count(num_keypoints)
     if height > 0 and width > 0 and num_candidates > height * width:
         raise typer.BadParameter(
             f"The extractor requires {num_candidates} candidate locations, more than the {height * width} pixels."
@@ -143,7 +143,18 @@ def export(
         typer.echo(
             "Converting to FP16. Warning: This FP16 model should NOT be used for TensorRT. TRT provides its own fp16 option."
         )
-        onnx.save_model(convert_float_to_float16(onnx.load_model(output)), output.with_suffix(".fp16.onnx"))
+        from onnxruntime.transformers.onnx_model import OnnxModel
+
+        fp16_model = convert_float_to_float16(onnx.load_model(output))
+        # The ORT converter can append precision-boundary Cast nodes after their
+        # consumers and leave stale FP16 value_info on blocked FP32 constants.
+        # Restore a valid topological order, then rebuild intermediate type/shape
+        # annotations from operator semantics before saving the converted graph.
+        OnnxModel(fp16_model).topological_sort(is_deterministic=True)
+        del fp16_model.graph.value_info[:]
+        fp16_model = onnx.shape_inference.infer_shapes(fp16_model, strict_mode=True, data_prop=True)
+        onnx.checker.check_model(fp16_model, full_check=True)
+        onnx.save_model(fp16_model, output.with_suffix(".fp16.onnx"), save_as_external_data=False)
 
 
 @app.command()
@@ -211,6 +222,10 @@ def infer(
 
     session_options = ort.SessionOptions()  # type: ignore[possibly-missing-attribute]
     session_options.enable_profiling = profile
+    if fp16 and device == InferenceDevice.cuda:
+        # ORT 1.27's level-3 CastFloat16/layout pass aborts on converted
+        # dynamic graphs. Extended optimization is the strongest safe level.
+        session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
     # session_options.optimized_model_filepath = "weights/ort_optimized.onnx"
 
     providers: list[tuple[str, dict[str, object]]] = [("CPUExecutionProvider", {})]

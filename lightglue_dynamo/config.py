@@ -39,6 +39,13 @@ class Extractor(StrEnum):
         """Detector candidates considered for each public output keypoint."""
         return 2 if self is Extractor.raco_aliked else 1
 
+    def keypoint_candidate_count(self, num_keypoints: int) -> int:
+        """Return the statically exported detector pool for an output budget."""
+        candidates = num_keypoints * self.keypoint_candidate_multiplier
+        if self is Extractor.raco_aliked:
+            candidates = min(candidates, 3840)
+        return max(num_keypoints, candidates)
+
     @property
     def lightglue_config(self) -> dict[str, Any]:
         match self:

@@ -39,13 +39,29 @@ def test_export_and_infer_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
 
     result = runner.invoke(
         app,
-        ["export", "superpoint", "-o", str(model_path), "-b", "2", "-h", "64", "-w", "64", "--num-keypoints", "128"],
+        [
+            "export",
+            "superpoint",
+            "-o",
+            str(model_path),
+            "-b",
+            "2",
+            "-h",
+            "64",
+            "-w",
+            "64",
+            "--num-keypoints",
+            "128",
+            "--fp16",
+        ],
     )
     assert result.exit_code == 0, result.output
     assert model_path.exists()
     assert not model_path.with_suffix(model_path.suffix + ".data").exists()
     graph = onnx.load(model_path).graph
     assert all(node.op_type != "Floor" for node in graph.node)
+    fp16_model = onnx.load(model_path.with_suffix(".fp16.onnx"))
+    onnx.checker.check_model(fp16_model, full_check=True)
 
     result = runner.invoke(
         app,

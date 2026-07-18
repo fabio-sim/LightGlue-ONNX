@@ -73,6 +73,7 @@ class RaCo(nn.Module):
         self,
         num_keypoints: int = 2048,
         candidate_multiplier: int = 2,
+        max_num_candidates: int | None = 3840,
         nms_radius: int = 3,
         subpixel_sampling: bool = True,
         subpixel_temperature: float = 0.5,
@@ -86,12 +87,17 @@ class RaCo(nn.Module):
             raise ValueError("num_keypoints must be positive")
         if candidate_multiplier <= 0:
             raise ValueError("candidate_multiplier must be positive")
+        if max_num_candidates is not None and max_num_candidates <= 0:
+            raise ValueError("max_num_candidates must be positive or None")
         self.num_keypoints = num_keypoints
         # Rank a larger detector-selected pool, then retain only the requested
         # number of points. A 2x pool follows RaCo's 2048-candidate regime for
         # the common 1024-point setting without increasing descriptor or matcher
         # work. There is no benefit to over-extraction when ranking is disabled.
-        self.num_candidates = num_keypoints * candidate_multiplier if sort_by_ranker else num_keypoints
+        multiplied_candidates = num_keypoints * candidate_multiplier
+        if max_num_candidates is not None:
+            multiplied_candidates = min(multiplied_candidates, max_num_candidates)
+        self.num_candidates = max(num_keypoints, multiplied_candidates) if sort_by_ranker else num_keypoints
         self.nms_radius = nms_radius
         self.subpixel_sampling = subpixel_sampling
         self.subpixel_temperature = subpixel_temperature
