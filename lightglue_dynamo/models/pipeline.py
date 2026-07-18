@@ -9,6 +9,12 @@ class Pipeline(torch.nn.Module):
         self.extractor = extractor
         self.matcher = matcher
 
+    def fuse_batch_norm(self) -> None:
+        """Apply extractor-specific inference BatchNorm folding when available."""
+        fuse = getattr(self.extractor, "fuse_batch_norm", None)
+        if callable(fuse):
+            fuse()
+
     def forward(self, images: torch.Tensor) -> tuple[torch.Tensor, ...]:
         shape = shape_as_tensor(images)
         h = shape[-2]

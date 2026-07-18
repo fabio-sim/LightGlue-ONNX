@@ -1,3 +1,4 @@
+import copy
 from pathlib import Path
 
 import numpy as np
@@ -6,7 +7,7 @@ import torch
 
 from lightglue_dynamo.config import Extractor
 from lightglue_dynamo.models import Pipeline
-from lightglue_dynamo.models.aliked import DeformableConv2d, SparseDescriptorHead
+from lightglue_dynamo.models.aliked import ALIKEDDescriptor, DeformableConv2d, SparseDescriptorHead
 from lightglue_dynamo.models.lightglue import LightGlue
 from lightglue_dynamo.models.raco import RaCo, _chunked_topk
 from lightglue_dynamo.preprocessors import RaCoPreprocessor
@@ -41,6 +42,50 @@ def test_raco_checkpoint_filters_covariance_head(tmp_path: Path) -> None:
     loaded = RaCo(num_keypoints=16, weights=checkpoint)
     assert not hasattr(loaded, "covariance_estimator_head")
     assert all("covariance" not in name for name, _parameter in loaded.named_parameters())
+
+
+def _randomize_batch_norm(model: torch.nn.Module) -> None:
+    torch.manual_seed(10)
+    for module in model.modules():
+        if isinstance(module, torch.nn.BatchNorm2d):
+            with torch.no_grad():
+                module.weight.copy_(torch.rand_like(module.weight) + 0.5)
+                module.bias.copy_(torch.randn_like(module.bias))
+                module.running_mean.copy_(torch.randn_like(module.running_mean))
+                module.running_var.copy_(torch.rand_like(module.running_var) + 0.2)
+
+
+def test_raco_batch_norm_folding_preserves_outputs() -> None:
+    detector = RaCo(num_keypoints=128, weights=None).eval()
+    _randomize_batch_norm(detector)
+    fused = copy.deepcopy(detector)
+    fused.fuse_batch_norm()
+    images = torch.rand(2, 3, 64, 96)
+
+    with torch.inference_mode():
+        expected = detector(images)
+        actual = fused(images)
+
+    assert not any(isinstance(module, torch.nn.BatchNorm2d) for module in fused.modules())
+    for actual_output, expected_output in zip(actual, expected, strict=True):
+        torch.testing.assert_close(actual_output, expected_output, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("portable", [False, True])
+def test_aliked_batch_norm_folding_preserves_outputs(portable: bool) -> None:
+    descriptor = ALIKEDDescriptor(weights=None, portable_deform_conv=portable).eval()
+    _randomize_batch_norm(descriptor)
+    fused = copy.deepcopy(descriptor)
+    fused.fuse_batch_norm()
+    images = torch.rand(2, 3, 64, 96)
+    keypoints = torch.rand(2, 16, 2) * torch.tensor([95.0, 63.0])
+
+    with torch.inference_mode():
+        expected = descriptor(images, keypoints)
+        actual = fused(images, keypoints)
+
+    assert not any(isinstance(module, torch.nn.BatchNorm2d) for module in fused.modules())
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
 
 
 def test_raco_truncates_ranked_candidate_pool() -> None:

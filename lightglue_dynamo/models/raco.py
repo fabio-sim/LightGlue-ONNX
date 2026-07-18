@@ -3,6 +3,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.nn.utils.fusion import fuse_conv_bn_eval
 
 from ..ops.shape_utils import shape_as_tensor
 
@@ -20,6 +21,14 @@ class ConvBlock(nn.Module):
         tensor = self.gate(self.bn1(self.conv1(tensor)))
         return self.gate(self.bn2(self.conv2(tensor)))
 
+    def fuse_batch_norm(self) -> None:
+        if isinstance(self.bn1, nn.BatchNorm2d):
+            self.conv1 = fuse_conv_bn_eval(self.conv1, self.bn1)
+            self.bn1 = nn.Identity()
+        if isinstance(self.bn2, nn.BatchNorm2d):
+            self.conv2 = fuse_conv_bn_eval(self.conv2, self.bn2)
+            self.bn2 = nn.Identity()
+
 
 class ResBlock(nn.Module):
     def __init__(self, in_channels: int, out_channels: int) -> None:
@@ -36,6 +45,14 @@ class ResBlock(nn.Module):
         tensor = self.gate(self.bn1(self.conv1(tensor)))
         tensor = self.bn2(self.conv2(tensor))
         return self.gate(tensor + identity)
+
+    def fuse_batch_norm(self) -> None:
+        if isinstance(self.bn1, nn.BatchNorm2d):
+            self.conv1 = fuse_conv_bn_eval(self.conv1, self.bn1)
+            self.bn1 = nn.Identity()
+        if isinstance(self.bn2, nn.BatchNorm2d):
+            self.conv2 = fuse_conv_bn_eval(self.conv2, self.bn2)
+            self.bn2 = nn.Identity()
 
 
 def _conv1x1(in_channels: int, out_channels: int) -> nn.Conv2d:
@@ -173,6 +190,14 @@ class RaCo(nn.Module):
         self.load_state_dict(filtered, strict=True)
         if len(covariance_keys) != 5:
             raise RuntimeError(f"Expected five covariance-head tensors, found {len(covariance_keys)}")
+
+    def fuse_batch_norm(self) -> None:
+        """Fold inference BatchNorm parameters into their preceding convolutions."""
+        if self.training:
+            raise RuntimeError("BatchNorm folding requires RaCo.eval()")
+        for module in self.modules():
+            if isinstance(module, (ConvBlock, ResBlock)):
+                module.fuse_batch_norm()
 
     def forward(self, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         image = (image - self.image_mean) / self.image_std

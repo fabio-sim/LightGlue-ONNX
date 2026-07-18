@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 import torchvision
 from torch import nn
+from torch.nn.utils.fusion import fuse_conv_bn_eval
 
 from ..ops.shape_utils import shape_as_tensor
 
@@ -72,6 +73,17 @@ class DeformableConv2d(nn.Module):
         return output
 
 
+def _fuse_conv_bn(
+    convolution: nn.Conv2d | DeformableConv2d, batch_norm: nn.BatchNorm2d
+) -> nn.Conv2d | DeformableConv2d:
+    if isinstance(convolution, DeformableConv2d):
+        # BatchNorm is applied to the output channels after deformable sampling,
+        # so its affine transform can be folded into the ordinary projection.
+        convolution.regular_conv = fuse_conv_bn_eval(convolution.regular_conv, batch_norm)
+        return convolution
+    return fuse_conv_bn_eval(convolution, batch_norm)
+
+
 class ConvBlock(nn.Module):
     def __init__(
         self, in_channels: int, out_channels: int, *, deformable: bool = False, portable: bool = False
@@ -91,6 +103,14 @@ class ConvBlock(nn.Module):
     def forward(self, tensor: torch.Tensor) -> torch.Tensor:
         tensor = self.gate(self.bn1(self.conv1(tensor)))
         return self.gate(self.bn2(self.conv2(tensor)))
+
+    def fuse_batch_norm(self) -> None:
+        if isinstance(self.bn1, nn.BatchNorm2d):
+            self.conv1 = _fuse_conv_bn(self.conv1, self.bn1)
+            self.bn1 = nn.Identity()
+        if isinstance(self.bn2, nn.BatchNorm2d):
+            self.conv2 = _fuse_conv_bn(self.conv2, self.bn2)
+            self.bn2 = nn.Identity()
 
 
 class ResBlock(nn.Module):
@@ -115,6 +135,14 @@ class ResBlock(nn.Module):
         tensor = self.gate(self.bn1(self.conv1(tensor)))
         tensor = self.bn2(self.conv2(tensor))
         return self.gate(tensor + identity)
+
+    def fuse_batch_norm(self) -> None:
+        if isinstance(self.bn1, nn.BatchNorm2d):
+            self.conv1 = _fuse_conv_bn(self.conv1, self.bn1)
+            self.bn1 = nn.Identity()
+        if isinstance(self.bn2, nn.BatchNorm2d):
+            self.conv2 = _fuse_conv_bn(self.conv2, self.bn2)
+            self.bn2 = nn.Identity()
 
 
 class SparseDescriptorHead(nn.Module):
@@ -179,6 +207,14 @@ class ALIKEDDescriptor(nn.Module):
         filtered = {key: value for key, value in state.items() if not key.startswith("score_head.")}
         self.load_state_dict(filtered, strict=True)
 
+    def fuse_batch_norm(self) -> None:
+        """Fold inference BatchNorm parameters into regular and deformable convolutions."""
+        if self.training:
+            raise RuntimeError("BatchNorm folding requires ALIKEDDescriptor.eval()")
+        for module in self.modules():
+            if isinstance(module, (ConvBlock, ResBlock)):
+                module.fuse_batch_norm()
+
     def _dense_features(self, image: torch.Tensor) -> torch.Tensor:
         x1 = self.block1(image)
         x2 = self.block2(self.pool2(x1))
@@ -241,3 +277,9 @@ class RaCoALIKED(nn.Module):
         keypoints, detection_scores, ranker_scores = self.raco(image)
         descriptors = self.aliked(image, keypoints)
         return keypoints, detection_scores, descriptors, ranker_scores
+
+    def fuse_batch_norm(self) -> None:
+        if self.training:
+            raise RuntimeError("BatchNorm folding requires RaCoALIKED.eval()")
+        self.raco.fuse_batch_norm()
+        self.aliked.fuse_batch_norm()

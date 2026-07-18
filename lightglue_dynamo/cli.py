@@ -67,6 +67,7 @@ def export(
             extractor = RaCoALIKED(num_keypoints=num_keypoints, portable_deform_conv=portable_deform_conv)
     matcher = LightGlue(**extractor_type.lightglue_config)
     pipeline = Pipeline(extractor, matcher).eval()
+    pipeline.fuse_batch_norm()
 
     if output is None:
         output = Path(f"weights/{extractor_type}_lightglue_pipeline.onnx")
