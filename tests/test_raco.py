@@ -8,7 +8,7 @@ from lightglue_dynamo.config import Extractor
 from lightglue_dynamo.models import Pipeline
 from lightglue_dynamo.models.aliked import DeformableConv2d, SparseDescriptorHead
 from lightglue_dynamo.models.lightglue import LightGlue
-from lightglue_dynamo.models.raco import RaCo
+from lightglue_dynamo.models.raco import RaCo, _chunked_topk
 from lightglue_dynamo.preprocessors import RaCoPreprocessor
 
 
@@ -64,6 +64,28 @@ def test_raco_caps_candidates_without_reducing_output_count() -> None:
     assert RaCo(num_keypoints=4096, weights=None).num_candidates == 4096
     assert Extractor.raco_aliked.keypoint_candidate_count(2048) == 3840
     assert Extractor.raco_aliked.keypoint_candidate_count(4096) == 4096
+
+
+@pytest.mark.parametrize("length", [65_536, 65_537, 131_071])
+def test_chunked_topk_matches_direct_topk(length: int) -> None:
+    torch.manual_seed(length)
+    # Float64 random values make accidental ties vanishingly unlikely. TopK is
+    # allowed to return any member/order within an equal-valued boundary.
+    scores = torch.rand(2, length, dtype=torch.float64)
+    expected = scores.topk(3840)
+    values, indices = _chunked_topk(scores, 3840, 65_536)
+
+    torch.testing.assert_close(values, expected.values, atol=0, rtol=0)
+    torch.testing.assert_close(indices, expected.indices, atol=0, rtol=0)
+
+
+def test_chunked_topk_has_direct_fallback() -> None:
+    scores = torch.rand(2, 4096)
+    expected = scores.topk(128)
+    values, indices = _chunked_topk(scores, 128, None)
+
+    torch.testing.assert_close(values, expected.values, atol=0, rtol=0)
+    torch.testing.assert_close(indices, expected.indices, atol=0, rtol=0)
 
 
 def test_raco_preprocessor_is_rgb_float32() -> None:

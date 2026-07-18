@@ -216,6 +216,7 @@ class RaCoALIKED(nn.Module):
         subpixel_sampling: bool = True,
         subpixel_temperature: float = 0.5,
         sort_by_ranker: bool = True,
+        topk_chunk_size: int | None = 65536,
         portable_deform_conv: bool = False,
     ) -> None:
         super().__init__()
@@ -229,6 +230,7 @@ class RaCoALIKED(nn.Module):
             subpixel_sampling=subpixel_sampling,
             subpixel_temperature=subpixel_temperature,
             sort_by_ranker=sort_by_ranker,
+            topk_chunk_size=topk_chunk_size,
             weights=raco_weights or RaCo.weights_url,
         )
         self.aliked = ALIKEDDescriptor(

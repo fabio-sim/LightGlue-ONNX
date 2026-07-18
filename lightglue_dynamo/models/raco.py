@@ -66,6 +66,34 @@ def _sample(feature_map: torch.Tensor, keypoints: torch.Tensor) -> torch.Tensor:
     return sampled.squeeze(-1) if feature_map.shape[1] == 1 else sampled
 
 
+def _chunked_topk(
+    scores: torch.Tensor, count: int, chunk_size: int | None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select the exact global top-k through bounded, standard TopK operations.
+
+    TensorRT's TopK latency grows sharply when both the input axis and K are
+    large. Selecting K values from every disjoint chunk cannot discard a
+    member of the global top-k, so a second TopK over their union is equivalent
+    apart from the unspecified ordering of equal values. Keeping this as
+    ordinary tensor operations preserves the direct TopK fallback and avoids a
+    runtime-specific plugin.
+    """
+    if chunk_size is None:
+        top = scores.topk(count)
+        return top.values, top.indices
+    if chunk_size < count:
+        raise ValueError(f"topk_chunk_size ({chunk_size}) must be at least the candidate count ({count})")
+
+    length = scores.shape[-1]
+    padding = -length % chunk_size
+    chunks = F.pad(scores, (0, padding), value=-torch.inf).reshape(scores.shape[0], -1, chunk_size)
+    local_values, local_indices = chunks.topk(count, dim=-1, sorted=False)
+    offsets = torch.arange(chunks.shape[1], device=scores.device, dtype=local_indices.dtype).reshape(1, -1, 1)
+    local_indices = (local_indices + offsets * chunk_size).flatten(1)
+    values, order = local_values.flatten(1).topk(count, dim=-1)
+    return values, local_indices.gather(1, order)
+
+
 class RaCo(nn.Module):
     weights_url = "https://github.com/cvg/RaCo/releases/download/v1.0.0/raco.pth"
 
@@ -78,6 +106,7 @@ class RaCo(nn.Module):
         subpixel_sampling: bool = True,
         subpixel_temperature: float = 0.5,
         sort_by_ranker: bool = True,
+        topk_chunk_size: int | None = 65536,
         weights: str | Path | None = weights_url,
     ) -> None:
         super().__init__()
@@ -102,6 +131,7 @@ class RaCo(nn.Module):
         self.subpixel_sampling = subpixel_sampling
         self.subpixel_temperature = subpixel_temperature
         self.sort_by_ranker = sort_by_ranker
+        self.topk_chunk_size = topk_chunk_size
         self.register_buffer("image_mean", torch.tensor([0.485, 0.456, 0.406])[None, :, None, None], persistent=False)
         self.register_buffer("image_std", torch.tensor([0.229, 0.224, 0.225])[None, :, None, None], persistent=False)
 
@@ -165,13 +195,15 @@ class RaCo(nn.Module):
         probabilities = F.softmax(logits.flatten(1), dim=1).reshape_as(logits)
         nms = F.max_pool2d(probabilities, self.nms_radius, stride=1, padding=self.nms_radius // 2)
         probabilities_nms = probabilities * (probabilities == nms)
-        top = probabilities_nms.flatten(1).topk(self.num_candidates)
+        _top_values, top_indices = _chunked_topk(
+            probabilities_nms.flatten(1), self.num_candidates, self.topk_chunk_size
+        )
         width = shape_as_tensor(probabilities)[-1]
-        x = torch.remainder(top.indices, width)
-        y = torch.div(top.indices, width, rounding_mode="floor")
+        x = torch.remainder(top_indices, width)
+        y = torch.div(top_indices, width, rounding_mode="floor")
         keypoints = torch.stack((x, y), dim=-1).to(probabilities.dtype)
         if self.subpixel_sampling:
-            keypoints = keypoints + _subpixel_offsets(logits, top.indices, self.nms_radius, self.subpixel_temperature)
+            keypoints = keypoints + _subpixel_offsets(logits, top_indices, self.nms_radius, self.subpixel_temperature)
         detection_scores = _sample(probabilities, keypoints)
         ranker_scores = _sample(ranker_map, keypoints)
         keypoints = keypoints + 0.5
