@@ -9,15 +9,24 @@ class Pipeline(torch.nn.Module):
         self.extractor = extractor
         self.matcher = matcher
 
+    def fuse_batch_norm(self) -> None:
+        """Apply extractor-specific inference BatchNorm folding when available."""
+        fuse = getattr(self.extractor, "fuse_batch_norm", None)
+        if callable(fuse):
+            fuse()
+
     def forward(self, images: torch.Tensor) -> tuple[torch.Tensor, ...]:
         shape = shape_as_tensor(images)
         h = shape[-2]
         w = shape[-1]
         # Extract keypoints and features
-        keypoints, _scores, descriptors = self.extractor(images)
+        keypoints, _scores, descriptors, *_metadata = self.extractor(images)
         # Normalize keypoints
         size = torch.stack([w, h]).to(device=keypoints.device, dtype=keypoints.dtype)
-        normalized_keypoints = 2 * keypoints / size - 1
+        if getattr(self.extractor, "normalize_by_long_edge", False):
+            normalized_keypoints = (keypoints - size / 2) / (size.max() / 2)
+        else:
+            normalized_keypoints = 2 * keypoints / size - 1
         # Match keypoints
         matches, mscores = self.matcher(normalized_keypoints, descriptors)
         return keypoints, matches, mscores

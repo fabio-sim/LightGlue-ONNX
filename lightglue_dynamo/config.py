@@ -12,6 +12,7 @@ class InferenceDevice(StrEnum):
 class Extractor(StrEnum):
     superpoint = auto()
     disk = auto()
+    raco_aliked = auto()
 
     @property
     def input_dim_divisor(self) -> int:
@@ -20,6 +21,8 @@ class Extractor(StrEnum):
                 return 8
             case Extractor.disk:
                 return 16
+            case Extractor.raco_aliked:
+                return 32
 
     @property
     def input_channels(self) -> int:
@@ -28,6 +31,20 @@ class Extractor(StrEnum):
                 return 1
             case Extractor.disk:
                 return 3
+            case Extractor.raco_aliked:
+                return 3
+
+    @property
+    def keypoint_candidate_multiplier(self) -> int:
+        """Detector candidates considered for each public output keypoint."""
+        return 2 if self is Extractor.raco_aliked else 1
+
+    def keypoint_candidate_count(self, num_keypoints: int) -> int:
+        """Return the statically exported detector pool for an output budget."""
+        candidates = num_keypoints * self.keypoint_candidate_multiplier
+        if self is Extractor.raco_aliked:
+            candidates = min(candidates, 3840)
+        return max(num_keypoints, candidates)
 
     @property
     def lightglue_config(self) -> dict[str, Any]:
@@ -38,4 +55,9 @@ class Extractor(StrEnum):
                 return {
                     "input_dim": 128,
                     "url": "https://github.com/cvg/LightGlue/releases/download/v0.1_arxiv/disk_lightglue.pth",
+                }
+            case Extractor.raco_aliked:
+                return {
+                    "input_dim": 128,
+                    "url": "https://github.com/cvg/LightGlue/releases/download/v0.1_arxiv/raco_aliked_lightglue.pth",
                 }

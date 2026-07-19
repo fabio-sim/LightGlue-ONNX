@@ -1,9 +1,11 @@
+from pathlib import Path
+
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from ..ops import multi_head_attention_dispatch
+from ..ops import multi_head_attention
 
 torch.backends.cudnn.deterministic = True
 
@@ -24,8 +26,8 @@ class LearnableFourierPositionalEncoding(nn.Module):
         """encode position vector"""
         projected = self.Wr(x)
         cosines, sines = torch.cos(projected), torch.sin(projected)
-        emb = torch.stack([cosines, sines])
-        return emb.repeat_interleave(2, dim=3).repeat(1, 1, 1, self.num_heads).unsqueeze(4)
+        emb = torch.stack([cosines, sines]).unsqueeze(-3)
+        return emb.repeat_interleave(2, dim=-1)
 
 
 class TokenConfidence(nn.Module):
@@ -60,23 +62,22 @@ class SelfBlock(nn.Module):
     def forward(self, x: torch.Tensor, encoding: torch.Tensor) -> torch.Tensor:
         b, n, _ = x.shape
         qkv: torch.Tensor = self.Wqkv(x)
-        qkv = qkv.reshape((b, n, self.embed_dim, 3))
+        qkv = qkv.reshape((b, n, self.num_heads, self.head_dim, 3)).transpose(1, 2)
         qk, v = qkv[..., :2], qkv[..., 2]
         qk = self.apply_cached_rotary_emb(encoding, qk)
         q, k = qk[..., 0], qk[..., 1]
-        context = multi_head_attention_dispatch(q, k, v, self.num_heads)
+        q, k, v = (tensor.transpose(1, 2).reshape(b, n, self.embed_dim) for tensor in (q, k, v))
+        context = multi_head_attention(q, k, v, self.num_heads)
         message = self.out_proj(context)
         return x + self.ffn(torch.concat([x, message], 2))
 
     def rotate_half(self, qk: torch.Tensor) -> torch.Tensor:
-        b, n, _, _ = qk.shape
-        qk = qk.reshape((b, n, self.num_heads, self.head_dim // 2, 2, 2))
-        qk = torch.stack((-qk[..., 1, :], qk[..., 0, :]), dim=4)
-        qk = qk.reshape((b, n, self.embed_dim, 2))
-        return qk
+        qk = qk.unflatten(-2, (-1, 2))
+        qk = torch.stack((-qk[..., 1, :], qk[..., 0, :]), dim=-2)
+        return qk.flatten(-3, -2)
 
     def apply_cached_rotary_emb(self, encoding: torch.Tensor, qk: torch.Tensor) -> torch.Tensor:
-        return qk * encoding[0] + self.rotate_half(qk) * encoding[1]
+        return qk * encoding[0].unsqueeze(-1) + self.rotate_half(qk) * encoding[1].unsqueeze(-1)
 
 
 class CrossBlock(nn.Module):
@@ -100,12 +101,12 @@ class CrossBlock(nn.Module):
         )
 
     def forward(self, descriptors: torch.Tensor) -> torch.Tensor:
-        b, _, _ = descriptors.shape
         qk, v = self.to_qk(descriptors), self.to_v(descriptors)
 
-        indices = torch.arange(b, device=descriptors.device)
-        swap = (indices // 2) * 2 + (1 - indices % 2)  # swap trick
-        m = multi_head_attention_dispatch(qk, qk[swap], v[swap], self.num_heads)
+        point_count = descriptors.shape[1]
+        qk_swapped = qk.reshape(-1, 2, point_count, self.embed_dim).flip(1).flatten(0, 1)
+        v_swapped = v.reshape(-1, 2, point_count, self.embed_dim).flip(1).flatten(0, 1)
+        m = multi_head_attention(qk, qk_swapped, v_swapped, self.num_heads)
         m = self.to_out(m)
         descriptors = descriptors + self.ffn(torch.concat([descriptors, m], 2))
         return descriptors
@@ -179,7 +180,7 @@ class LightGlue(nn.Module):
 
     def __init__(
         self,
-        url: str,
+        url: str | Path,
         input_dim: int = 256,
         descriptor_dim: int = 256,
         num_heads: int = 4,
@@ -213,7 +214,10 @@ class LightGlue(nn.Module):
         self.token_confidence = nn.ModuleList([TokenConfidence(d) for _ in range(n - 1)])
         self.register_buffer("confidence_thresholds", torch.Tensor([self.confidence_threshold(i) for i in range(n)]))
 
-        state_dict = torch.hub.load_state_dict_from_url(url)
+        if isinstance(url, str) and url.startswith(("http://", "https://")):
+            state_dict = torch.hub.load_state_dict_from_url(url, map_location="cpu", weights_only=True)
+        else:
+            state_dict = torch.load(url, map_location="cpu", weights_only=True)
 
         # rename old state dict entries
         for i in range(n):
@@ -241,6 +245,36 @@ class LightGlue(nn.Module):
         scores = self.log_assignment[i](descriptors)  # (B, N, N)
         matches, mscores = filter_matches(scores, self.filter_threshold)
         return matches, mscores  # (M, 3), (M,)
+
+    @torch.inference_mode()
+    def forward_adaptive_depth(
+        self, keypoints: torch.Tensor, descriptors: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """Run host-orchestrated early stopping and report the executed layer count.
+
+        The scalar stop decision is copied to the host after each stage. This is
+        genuinely work-reducing in eager PyTorch, but it is intentionally kept out
+        of ``forward`` because ONNX and TensorRT exports remain fixed-depth graphs.
+        """
+        if not 0 < self.depth_confidence < 1:
+            raise ValueError("adaptive depth requires depth_confidence between 0 and 1")
+        descriptors = self.input_proj(descriptors)
+        encodings = self.posenc(keypoints)
+        executed_layers = self.n_layers
+        for layer_index in range(self.n_layers):
+            descriptors = self.transformers[layer_index](descriptors, encodings)
+            if layer_index == self.n_layers - 1:
+                continue
+            confidence0, confidence1 = self.token_confidence[layer_index](descriptors[0::2], descriptors[1::2])
+            num_points = confidence0.shape[-1] + confidence1.shape[-1]
+            should_stop = self.check_if_stop(confidence0, confidence1, layer_index, num_points)
+            if bool(should_stop.item()):
+                executed_layers = layer_index + 1
+                break
+
+        scores = self.log_assignment[executed_layers - 1](descriptors)
+        matches, mscores = filter_matches(scores, self.filter_threshold)
+        return matches, mscores, executed_layers
 
     def confidence_threshold(self, layer_index: int) -> float:
         """scaled confidence threshold"""

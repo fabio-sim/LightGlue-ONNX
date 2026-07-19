@@ -3,65 +3,108 @@ name = "lightglue-onnx"
 version = "2.1.0"
 description = "ONNX-compatible LightGlue: Local Feature Matching at Light Speed. Supports TensorRT, TorchDynamo"
 readme = "README.md"
-requires-python = ">=3.12,<4.0"
+requires-python = ">=3.12,<3.15"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Fabio Milentiansen Sim", email = "fabio.milentiansen.sim@gmail.com" }]
 dependencies = [
-    "matplotlib==3.10.8",
-    "numpy==2.2.6",
-    "nvidia-cublas-cu12==12.8.4.1; platform_system != \"Darwin\"",
-    "onnxruntime-gpu[cuda,cudnn]==1.23.2",
-    "opencv-python==4.12.0.88",
-    "typer==0.21.0",
+    "matplotlib==3.11.0",
+    "numpy==2.5.1",
+    "opencv-python==5.0.0.93",
+    "typer==0.27.0",
+]
+
+[project.optional-dependencies]
+torch-cpu = [
+    "torch==2.13.0",
+    "torchvision==0.28.0",
+]
+torch-cuda = [
+    "torch==2.13.0; platform_system == 'Linux' and platform_machine == 'x86_64'",
+    "torchvision==0.28.0; platform_system == 'Linux' and platform_machine == 'x86_64'",
 ]
 
 [project.scripts]
 lightglue-onnx = "lightglue_dynamo.cli:main"
 
 [dependency-groups]
+cpu = [
+    "onnxruntime==1.27.0",
+]
+cuda = [
+    "cuda-toolkit[cublas,cudart,cufft,curand,nvrtc]==13.0.3; platform_system == 'Linux' and platform_machine == 'x86_64'",
+    "nvidia-cudnn-cu13==9.20.0.48; platform_system == 'Linux' and platform_machine == 'x86_64'",
+    "onnxruntime-gpu==1.27.0; platform_system == 'Linux' and platform_machine == 'x86_64'",
+]
 export = [
-    "onnxscript==0.5.7",
-    "onnx==1.20.1",
-    "torch==2.9.1",
-    "torchaudio==2.9.1",
-    "torchvision==0.24.1",
+    "onnx==1.22.0",
+    "onnxscript==0.7.1",
 ]
 trt = [
-    "polygraphy==0.49.26",
-    "tensorrt==10.9.0.34",
+    "colored==2.3.2",
+    "polygraphy==0.50.3",
+    "tensorrt-cu13==10.16.1.11; platform_system == 'Linux' and platform_machine == 'x86_64'",
+    "tensorrt-cu13-libs==10.16.1.11; platform_system == 'Linux' and platform_machine == 'x86_64'",
 ]
 test = [
-    "pytest==8.4.2",
+    "pytest==9.1.1",
     "pytest-xdist==3.8.0",
+]
+lint = [
+    "ruff==0.15.21",
 ]
 
 [tool.uv.sources]
 torch = [
-  { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+  { index = "pytorch-cpu", extra = "torch-cpu" },
+  { index = "pytorch-cu130", extra = "torch-cuda" },
 ]
 torchvision = [
-  { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+  { index = "pytorch-cpu", extra = "torch-cpu" },
+  { index = "pytorch-cu130", extra = "torch-cuda" },
 ]
-torchaudio = [
-  { index = "pytorch-cu128", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
-]
+tensorrt-cu13-libs = { index = "nvidia" }
 
 [[tool.uv.index]]
-name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
 explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com"
+explicit = true
+
+[tool.uv]
+default-groups = ["cpu"]
+conflicts = [
+    [
+        { group = "cpu" },
+        { group = "cuda" },
+    ],
+    [
+        { extra = "torch-cpu" },
+        { extra = "torch-cuda" },
+    ],
+]
 
 [tool.uv.build-backend]
 module-name = "lightglue_dynamo"
 module-root = ""
 
 [build-system]
-requires = ["uv_build>=0.9.13,<0.10.0"]
+requires = ["uv_build>=0.11.29,<0.12.0"]
 build-backend = "uv_build"
 
 [tool.pytest.ini_options]
+testpaths = ["tests"]
 addopts = """
--n auto
+-n 2
+--capture=tee-sys
 """
 
 [tool.ruff]

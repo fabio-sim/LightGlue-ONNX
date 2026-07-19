@@ -1,10 +1,11 @@
+from math import ceil, sqrt
 from pathlib import Path
 from typing import Annotated, cast
 
 import cv2
 import typer
 
-from lightglue_dynamo.cli_utils import check_multiple_of
+from lightglue_dynamo.cli_utils import check_multiple_of, preload_nvidia_libraries
 from lightglue_dynamo.config import Extractor, InferenceDevice
 
 app = typer.Typer()
@@ -37,134 +38,124 @@ def export(
     num_keypoints: Annotated[
         int, typer.Option(min=128, help="Number of keypoints outputted by feature extractor.")
     ] = 1024,
-    fuse_multi_head_attention: Annotated[
+    opset: Annotated[int, typer.Option(min=16, max=20, help="ONNX opset version of exported model.")] = 20,
+    portable_deform_conv: Annotated[
         bool,
         typer.Option(
-            "--fuse-multi-head-attention",
-            help="Fuse multi-head attention subgraph into one optimized operation. (ONNX Runtime-only).",
+            "--portable-deform-conv/--onnx-deform-conv",
+            help="Decompose ALIKED DeformConv for TensorRT and WebGPU portability.",
         ),
-    ] = False,
-    dynamo_export: Annotated[
-        bool,
-        typer.Option(
-            "--dynamo-export/--legacy-export", help="Use the TorchDynamo ONNX exporter. Legacy export uses TorchScript."
-        ),
-    ] = False,
-    opset: Annotated[int, typer.Option(min=16, max=20, help="ONNX opset version of exported model.")] = 18,
+    ] = True,
     fp16: Annotated[bool, typer.Option("--fp16", help="Whether to also convert to FP16.")] = False,
 ) -> None:
     """Export LightGlue to ONNX."""
     import onnx
     import torch
-    from onnxruntime.tools.symbolic_shape_infer import SymbolicShapeInference
     from onnxruntime.transformers.float16 import convert_float_to_float16
+    from onnxscript import opset20 as onnx_op
 
-    from lightglue_dynamo.models import DISK, LightGlue, Pipeline, SuperPoint
-    from lightglue_dynamo.ops import use_fused_multi_head_attention
+    from lightglue_dynamo.models import DISK, LightGlue, Pipeline, RaCoALIKED, SuperPoint
 
     match extractor_type:
         case Extractor.superpoint:
             extractor = SuperPoint(num_keypoints=num_keypoints)
         case Extractor.disk:
             extractor = DISK(num_keypoints=num_keypoints)
+        case Extractor.raco_aliked:
+            if opset < 20:
+                raise typer.BadParameter("raco_aliked export requires ONNX opset 20.")
+            extractor = RaCoALIKED(num_keypoints=num_keypoints, portable_deform_conv=portable_deform_conv)
     matcher = LightGlue(**extractor_type.lightglue_config)
     pipeline = Pipeline(extractor, matcher).eval()
+    pipeline.fuse_batch_norm()
 
     if output is None:
         output = Path(f"weights/{extractor_type}_lightglue_pipeline.onnx")
+
+    output_names = ["keypoints", "matches", "mscores"]
 
     check_multiple_of(batch_size, 2)
     check_multiple_of(height, extractor_type.input_dim_divisor)
     check_multiple_of(width, extractor_type.input_dim_divisor)
 
-    if height > 0 and width > 0 and num_keypoints > height * width:
-        raise typer.BadParameter("num_keypoints cannot be greater than height * width.")
-
-    if fuse_multi_head_attention:
-        typer.echo(
-            "Warning: Multi-head attention nodes will be fused. Exported model will only work with ONNX Runtime CPU & CUDA execution providers."
+    num_candidates = extractor_type.keypoint_candidate_count(num_keypoints)
+    if height > 0 and width > 0 and num_candidates > height * width:
+        raise typer.BadParameter(
+            f"The extractor requires {num_candidates} candidate locations, more than the {height * width} pixels."
         )
-        torch_version = tuple(int(part) for part in torch.__version__.split("+")[0].split(".")[:3])
-        if torch_version < (2, 4):
-            raise typer.Abort("Fused multi-head attention requires PyTorch 2.4 or later.")
-        use_fused_multi_head_attention()
-        if dynamo_export:
-            typer.echo(
-                "Warning: Fused multi-head attention is not supported by the Dynamo exporter. Using legacy export."
-            )
 
-    def build_dynamic_config(
-        use_dynamo: bool,
-    ) -> tuple[dict[str, dict[int, str]] | None, tuple[dict[int, str], ...] | None]:
-        dynamic_axes: dict[str, dict[int, str]] | None = None
-        dynamic_shapes: tuple[dict[int, str], ...] | None = None
-        if use_dynamo:
-            image_shapes: dict[int, str] = {}
-            if batch_size == 0:
-                image_shapes[0] = "batch_size"
-            if height == 0:
-                image_shapes[2] = "height"
-            if width == 0:
-                image_shapes[3] = "width"
-            if image_shapes:
-                dynamic_shapes = (image_shapes,)
+    def build_dynamic_shapes() -> tuple[dict[int, object], ...] | None:
+        image_shapes: dict[int, object] = {}
+        divisor = extractor_type.input_dim_divisor
+        square_factor = max(2, ceil(sqrt(num_candidates) / divisor))
+        if batch_size == 0:
+            pair_count = torch.export.Dim("pair_count", min=1)
+            image_shapes[0] = 2 * pair_count
+        if height == 0:
+            minimum_height_factor = max(2, ceil(num_candidates / width / divisor)) if width else square_factor
+            height_factor = torch.export.Dim("height_factor", min=minimum_height_factor)
+            image_shapes[2] = divisor * height_factor
+        if width == 0:
+            minimum_width_factor = max(2, ceil(num_candidates / height / divisor)) if height else square_factor
+            width_factor = torch.export.Dim("width_factor", min=minimum_width_factor)
+            image_shapes[3] = divisor * width_factor
+        return (image_shapes,) if image_shapes else None
+
+    def export_model() -> None:
+        def translate_integer_div(self: object, other: object, rounding_mode: str | None = None) -> object:
+            if rounding_mode not in {"floor", "trunc"}:
+                raise ValueError(f"Unsupported integer division mode: {rounding_mode}")
+            # The default ONNX decomposition casts the quotient through float. TensorRT
+            # then lowers that cast to FP16, overflowing flattened image indices above
+            # 65504. These operands are non-negative integers, so ONNX integer Div is
+            # exactly equivalent to both supported rounding modes without a float cast.
+            return onnx_op.Div(self, other)
+
+        example_batch = batch_size or 4
+        divisor = extractor_type.input_dim_divisor
+        dynamic_side = max(2 * divisor, ceil(sqrt(num_candidates) / divisor) * divisor)
+        if height == 0 and width > 0:
+            example_height = max(2 * divisor, ceil(num_candidates / width / divisor) * divisor)
         else:
-            dynamic_axes = {"matches": {0: "num_matches"}, "mscores": {0: "num_matches"}}
-            dynamic_axes["images"] = {}
-            dynamic_axes["keypoints"] = {}
-            if batch_size == 0:
-                dynamic_axes["images"][0] = "batch_size"
-                dynamic_axes["keypoints"][0] = "batch_size"
-            if height == 0:
-                dynamic_axes["images"][2] = "height"
-            if width == 0:
-                dynamic_axes["images"][3] = "width"
-        return dynamic_axes, dynamic_shapes
-
-    def export_model(use_dynamo: bool) -> None:
-        dynamic_axes, dynamic_shapes = build_dynamic_config(use_dynamo)
-        inputs = (torch.zeros(batch_size or 2, extractor_type.input_channels, height or 256, width or 256),)
+            example_height = height or dynamic_side
+        if width == 0 and height > 0:
+            example_width = max(2 * divisor, ceil(num_candidates / height / divisor) * divisor)
+        else:
+            example_width = width or dynamic_side
+        inputs = (torch.zeros(example_batch, extractor_type.input_channels, example_height, example_width),)
         torch.onnx.export(
             pipeline,
             inputs,
             str(output),
             input_names=["images"],
-            output_names=["keypoints", "matches", "mscores"],
+            output_names=output_names,
             opset_version=opset,
-            dynamic_axes=dynamic_axes,
-            dynamic_shapes=dynamic_shapes,
-            dynamo=use_dynamo,
+            dynamic_shapes=build_dynamic_shapes(),
+            dynamo=True,
+            external_data=False,
+            optimize=False,
+            custom_translation_table={torch.ops.aten.div.Tensor_mode: translate_integer_div},
         )
 
-    use_dynamo = dynamo_export and not fuse_multi_head_attention
-    try:
-        export_model(use_dynamo)
-        onnx.checker.check_model(output)
-    except Exception as exc:
-        if not use_dynamo:
-            raise
-        typer.echo(
-            f"Warning: Dynamo exporter failed ({exc}). Falling back to legacy exporter. "
-            "Use --legacy-export to skip Dynamo."
-        )
-        export_model(False)
-        onnx.checker.check_model(output)
-    try:
-        inferred = SymbolicShapeInference.infer_shapes(onnx.load_model(output), auto_merge=True)
-        onnx.save_model(inferred, output)
-    except Exception as exc:
-        typer.echo(f"Warning: Symbolic shape inference failed ({exc}). Falling back to onnx.shape_inference.")
-        try:
-            inferred = onnx.shape_inference.infer_shapes(onnx.load_model(output))
-            onnx.save_model(inferred, output)
-        except Exception as fallback_exc:
-            typer.echo(f"Warning: onnx.shape_inference failed ({fallback_exc}). Skipping.")
+    export_model()
+    onnx.checker.check_model(output)
     typer.echo(f"Successfully exported model to {output}")
     if fp16:
         typer.echo(
             "Converting to FP16. Warning: This FP16 model should NOT be used for TensorRT. TRT provides its own fp16 option."
         )
-        onnx.save_model(convert_float_to_float16(onnx.load_model(output)), output.with_suffix(".fp16.onnx"))
+        from onnxruntime.transformers.onnx_model import OnnxModel
+
+        fp16_model = convert_float_to_float16(onnx.load_model(output))
+        # The ORT converter can append precision-boundary Cast nodes after their
+        # consumers and leave stale FP16 value_info on blocked FP32 constants.
+        # Restore a valid topological order, then rebuild intermediate type/shape
+        # annotations from operator semantics before saving the converted graph.
+        OnnxModel(fp16_model).topological_sort(is_deterministic=True)
+        del fp16_model.graph.value_info[:]
+        fp16_model = onnx.shape_inference.infer_shapes(fp16_model, strict_mode=True, data_prop=True)
+        onnx.checker.check_model(fp16_model, full_check=True)
+        onnx.save_model(fp16_model, output.with_suffix(".fp16.onnx"), save_as_external_data=False)
 
 
 @app.command()
@@ -198,10 +189,15 @@ def infer(
     import time
 
     import numpy as np
+
+    # A GPU wheel can still be used with the CPU EP; preload is harmless for a
+    # CPU-only wheel and avoids failing the ORT import in a mixed environment.
+    preload_nvidia_libraries(tensorrt=device == InferenceDevice.tensorrt)
+
     import onnxruntime as ort
 
     from lightglue_dynamo import viz
-    from lightglue_dynamo.preprocessors import DISKPreprocessor, SuperPointPreprocessor
+    from lightglue_dynamo.preprocessors import DISKPreprocessor, RaCoPreprocessor, SuperPointPreprocessor
 
     def _load_and_resize(path: Path) -> np.ndarray:
         image = cv2.imread(str(path))
@@ -216,6 +212,8 @@ def infer(
             images = SuperPointPreprocessor.preprocess(images)
         case Extractor.disk:
             images = DISKPreprocessor.preprocess(images)
+        case Extractor.raco_aliked:
+            images = RaCoPreprocessor.preprocess(images)
     images = images.astype(np.float16 if fp16 and device != InferenceDevice.tensorrt else np.float32)
 
     if device in {InferenceDevice.cuda, InferenceDevice.tensorrt}:
@@ -225,6 +223,10 @@ def infer(
 
     session_options = ort.SessionOptions()  # type: ignore[possibly-missing-attribute]
     session_options.enable_profiling = profile
+    if fp16 and device == InferenceDevice.cuda:
+        # ORT 1.27's level-3 CastFloat16/layout pass aborts on converted
+        # dynamic graphs. Extended optimization is the strongest safe level.
+        session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
     # session_options.optimized_model_filepath = "weights/ort_optimized.onnx"
 
     providers: list[tuple[str, dict[str, object]]] = [("CPUExecutionProvider", {})]
@@ -287,7 +289,7 @@ def infer(
         outputs = cast(list[np.ndarray], session.run(None, {"images": images}))
         if profile:
             last_inference_time = time.perf_counter() - start
-        keypoints, matches, _mscores = outputs[0], outputs[1], outputs[2]
+        keypoints, matches, _mscores = outputs
 
     match_count = int(matches.shape[0])
     typer.echo(f"Matches: {match_count}")
@@ -343,6 +345,8 @@ def trtexec(
     """Run pure TensorRT inference for LightGlue model using Polygraphy (requires TensorRT to be installed)."""
     import site
 
+    preload_nvidia_libraries(tensorrt=True)
+
     import numpy as np
     from polygraphy.backend.common import BytesFromPath
     from polygraphy.backend.trt import (
@@ -355,7 +359,7 @@ def trtexec(
     )
 
     from lightglue_dynamo import viz
-    from lightglue_dynamo.preprocessors import DISKPreprocessor, SuperPointPreprocessor
+    from lightglue_dynamo.preprocessors import DISKPreprocessor, RaCoPreprocessor, SuperPointPreprocessor
 
     def _load_and_resize(path: Path) -> np.ndarray:
         image = cv2.imread(str(path))
@@ -370,6 +374,8 @@ def trtexec(
             images = SuperPointPreprocessor.preprocess(images)
         case Extractor.disk:
             images = DISKPreprocessor.preprocess(images)
+        case Extractor.raco_aliked:
+            images = RaCoPreprocessor.preprocess(images)
     images = images.astype(np.float32)
 
     if strongly_typed and precision_constraints.lower() != "none":
@@ -397,11 +403,14 @@ def trtexec(
         for path in site_paths:
             base = Path(path)
             trt_libs = base / "tensorrt_libs"
-            cuda_runtime = base / "nvidia" / "cuda_runtime" / "lib"
+            cuda_runtime = base / "nvidia" / "cu13" / "lib"
+            legacy_cuda_runtime = base / "nvidia" / "cuda_runtime" / "lib"
             if trt_libs.exists():
                 candidates.append(trt_libs)
             if cuda_runtime.exists():
                 candidates.append(cuda_runtime)
+            if legacy_cuda_runtime.exists():
+                candidates.append(legacy_cuda_runtime)
         if candidates:
             joined = ":".join(str(path) for path in candidates)
             typer.echo("Hint: add TensorRT + CUDA runtime libs to LD_LIBRARY_PATH, e.g.:")

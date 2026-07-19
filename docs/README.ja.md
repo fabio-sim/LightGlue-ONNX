@@ -10,17 +10,16 @@
 
 [LightGlue: Local Feature Matching at Light Speed](https://github.com/cvg/LightGlue) の ONNX（Open Neural Network Exchange）互換実装です。ONNX モデルフォーマットにより、複数の実行プロバイダーに対応し、さまざまなプラットフォーム間での相互運用性が向上します。また、PyTorch などの Python 固有の依存関係を排除します。TensorRT および OpenVINO をサポートしています。[詳細記事](https://fabio-sim.github.io)。
 
-> ✨ ***新機能***: FP8 量子化ワークフロー。詳細はこの [ブログ記事](https://fabio-sim.github.io/blog/fp8-quantized-lightglue-tensorrt-nvidia-model-optimizer/) をご覧ください。
+> ✨ ***新機能***: 最適化された RaCo-ALIKED-LightGlue+。詳細はこの [ブログ記事](https://fabio-sim.github.io/blog/gpt-5-6-sol-discovers-tensorrt-optimizations-raco-aliked-lightglue/) をご覧ください。
 
-<p align="center"><a href="https://fabio-sim.github.io/blog/accelerating-lightglue-inference-onnx-runtime-tensorrt/"><img src="../assets/inference-comparison-speedup.svg" alt="レイテンシ比較" width=90%></a><br><em>⏱️ 推論時間の比較</em></p>
+<p align="center"><a href="https://fabio-sim.github.io/blog/gpt-5-6-sol-discovers-tensorrt-optimizations-raco-aliked-lightglue/"><img src="../assets/marunouchi-animation.webp" alt="RaCo-ALIKED-LightGlue+" width=90%></a></p>
 
-<p align="center"><a href="https://arxiv.org/abs/2306.13643"><img src="../assets/easy_hard.jpg" alt="LightGlue 図" width=80%></a></p>
-
-**2026年1月19日**: FP8 量子化ワークフローのガイドを追加（ModelOpt Q/DQ エクスポートと TensorRT の使用）。
+**2026年7月20日**: RaCo-ALIKED-LightGlue+ とベンチマークを追加。
 
 <details>
 <summary>更新履歴</summary>
 
+- **2026年1月19日**: FP8 量子化ワークフローのガイドを追加（ModelOpt Q/DQ エクスポートと TensorRT の使用）。[ブログ記事](https://fabio-sim.github.io/blog/fp8-quantized-lightglue-tensorrt-nvidia-model-optimizer/)
 - **2026年1月9日**: モダンな uv で CLI UX を刷新し、`lightglue-onnx` のワークフローを整理、非推奨スタックを削除しつつ依存関係と TensorRT/形状推論の案内を更新。
 - **2024年7月17日**: エンドツーエンドの並列動的バッチサイズのサポート。スクリプト UX の改良。 [ブログ記事](https://fabio-sim.github.io/blog/accelerating-lightglue-inference-onnx-runtime-tensorrt/) を追加。
 - **2023年11月2日**: 約30%のスピードアップのために ArgMax を最適化する TopK トリックを導入。
@@ -47,16 +46,22 @@ LightGlue を簡単に ONNX へエクスポートし、ONNX Runtime で推論を
 uv sync
 ```
 
-エクスポート対応（PyTorch + ONNX を追加）：
+CPU エクスポート対応（PyTorch、torchvision、ONNX、ONNX Script を追加）：
 
 ```shell
-uv sync --group export
+uv sync --group export --extra torch-cpu
+```
+
+CUDA エクスポートおよび推論対応（Linux x86-64）：
+
+```shell
+uv sync --no-group cpu --group cuda --group export --extra torch-cuda
 ```
 
 TensorRT CLI 対応：
 
 ```shell
-uv sync --group trt
+uv sync --no-group cpu --group cuda --group export --group trt --extra torch-cuda
 ```
 
 ```shell
@@ -74,14 +79,17 @@ LightGlue Dynamo CLI
 ╰──────────────────────────────────────────────────╯
 ```
 
-各コマンドのオプションを確認するには、`--help` を使用してください。CLI は完全なエクストラクタ-マッチャー パイプラインをエクスポートするため、中間ステップの調整に悩む必要はありません。
+各コマンドのオプションを確認するには、`--help` を使用してください。CLI は完全なエクストラクタ-マッチャー パイプラインをエクスポートするため、中間ステップの調整に悩む必要はありません。推論はデフォルトで利用可能な場合に CUDA を使用し、要求したプロバイダーを読み込めない場合は CPU にフォールバックします。
 
 ### GPU 前提条件
-ONNX Runtime の CUDA/TensorRT 実行プロバイダーは、対応する CUDA/cuDNN が必要です。PyPI で CUDA/TensorRT ランタイム（例: `onnxruntime-gpu[cuda,cudnn]`, `tensorrt`）をインストールした場合、Polygraphy/TRT EP が `libcudart.so` と `libnvinfer.so` を見つけられるように `LD_LIBRARY_PATH` に venv のパスを追加してください:
+ONNX Runtime の CUDA/TensorRT 実行プロバイダーには、プラットフォームに対応する CUDA/cuDNN バージョンが必要です。プロバイダーの読み込みエラーが発生した場合は、ONNX Runtime CUDA プロバイダーのドキュメントで CUDA/cuDNN の構成を確認してください。
+PyPI 経由で CUDA/TensorRT ランタイムライブラリ（例: `onnxruntime-gpu[cuda,cudnn]`、`tensorrt`）をインストールした場合、Polygraphy と TensorRT EP が `libcudart.so` と `libnvinfer.so` を見つけられるように、venv のパスを `LD_LIBRARY_PATH` に追加する必要があることがあります：
 
 ```shell
-export LD_LIBRARY_PATH="$PWD/.venv/lib/python3.12/site-packages/tensorrt_libs:$PWD/.venv/lib/python3.12/site-packages/nvidia/cuda_runtime/lib:${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="$PWD/.venv/lib/python3.12/site-packages/tensorrt_libs:$PWD/.venv/lib/python3.12/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH:-}"
 ```
+
+CLI は wheel に含まれるこれらのライブラリを自動的にプリロードしますが、この環境変数は CLI 外から起動するサードパーティ製ツールでも引き続き役立ちます。
 
 ## 📖 使用例コマンド
 
@@ -171,6 +179,24 @@ uv run lightglue-onnx infer \
   -d openvino
 </pre>
 </details>
+
+## 🌐 ブラウザー WebGPU デモ
+
+静的デモを配信し、`http://localhost:8000` を開きます：
+
+```shell
+uvx static-http --directory web --port 8000 --localhost-only
+```
+
+## ⏱️ 推論速度と出力品質
+
+`torch.compile()` とのベンチマーク比較（[詳細はこちら](https://fabio-sim.github.io/blog/gpt-5-6-sol-discovers-tensorrt-optimizations-raco-aliked-lightglue/)）：
+
+<p align="center"><a href="https://fabio-sim.github.io/blog/gpt-5-6-sol-discovers-tensorrt-optimizations-raco-aliked-lightglue/"><img src="../assets/postoptimization-speedup-heatmap.svg" alt="RaCo-ALIKED-LightGlue+ の速度向上" width=90%></a></p>
+
+<p align="center"><a href="https://fabio-sim.github.io/blog/gpt-5-6-sol-discovers-tensorrt-optimizations-raco-aliked-lightglue/"><img src="../assets/postoptimization-match-quality.svg" alt="RaCo-ALIKED-LightGlue+ のマッチング品質" width=90%></a></p>
+
+<p align="center"><a href="https://fabio-sim.github.io/blog/gpt-5-6-sol-discovers-tensorrt-optimizations-raco-aliked-lightglue/"><img src="../assets/postoptimization-pareto-frontier.svg" alt="RaCo-ALIKED-LightGlue+ のパレートフロンティア" width=90%></a></p>
 
 ## クレジット
 もし本リポジトリのコードや論文のアイデアを使用した場合は、[LightGlue](https://arxiv.org/abs/2306.13643)、[SuperPoint](https://arxiv.org/abs/1712.07629)、および [DISK](https://arxiv.org/abs/2006.13566) の著者を引用することを検討してください。また、ONNX バージョンが役に立った場合は、このリポジトリにスターを付けていただけると幸いです。
