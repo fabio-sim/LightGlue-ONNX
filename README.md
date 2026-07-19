@@ -10,17 +10,16 @@
 
 Open Neural Network Exchange (ONNX) compatible implementation of [LightGlue: Local Feature Matching at Light Speed](https://github.com/cvg/LightGlue). The ONNX model format allows for interoperability across different platforms with support for multiple execution providers, and removes Python-specific dependencies such as PyTorch. Supports TensorRT and OpenVINO. [Detailed write-up](https://fabio-sim.github.io).
 
-> ✨ ***What's New***: FP8 Quantization Workflow. Read more in this [blog post](https://fabio-sim.github.io/blog/fp8-quantized-lightglue-tensorrt-nvidia-model-optimizer/).
+> ✨ ***What's New***: Optimized RaCo-ALIKED-LightGlue+. Read more in this [blog post](https://fabio-sim.github.io/blog/gpt-5-6-sol-discovers-tensorrt-optimizations-raco-aliked-lightglue/).
 
-<p align="center"><a href="https://fabio-sim.github.io/blog/accelerating-lightglue-inference-onnx-runtime-tensorrt/"><img src="assets/inference-comparison-speedup.svg" alt="Latency Comparison" width=90%></a><br><em>⏱️ Inference Time Comparison</em></p>
+<p align="center"><a href="https://fabio-sim.github.io/blog/gpt-5-6-sol-discovers-tensorrt-optimizations-raco-aliked-lightglue/"><img src="assets/marunouchi-animation.webp" alt="Raco-ALIKED-LightGlue+" width=90%></a></p>
 
-<p align="center"><a href="https://arxiv.org/abs/2306.13643"><img src="assets/easy_hard.jpg" alt="LightGlue figure" width=80%></a></p>
-
-**19 January 2026**: Add FP8 quantization workflow (ModelOpt Q/DQ export and TensorRT usage notes).
+**20 July 2026**: Add RaCo-ALIKED-LightGlue+ and benchmarks.
 
 <details>
 <summary>Changelog</summary>
 
+- **19 January 2026**: Add FP8 quantization workflow (ModelOpt Q/DQ export and TensorRT usage notes). [Blog Post](https://fabio-sim.github.io/blog/fp8-quantized-lightglue-tensorrt-nvidia-model-optimizer/)
 - **09 January 2026**: Refurbish the CLI UX with modern uv, streamline the `lightglue-onnx` workflow, and remove deprecated stacks while refreshing dependencies and TensorRT/shape-inference guidance.
 - **17 July 2024**: End-to-end parallel dynamic batch size support. Revamp script UX. Add [blog post](https://fabio-sim.github.io/blog/accelerating-lightglue-inference-onnx-runtime-tensorrt/).
 - **02 November 2023**: Introduce TopK-trick to optimize out ArgMax for about 30% speedup.
@@ -182,15 +181,23 @@ uv run lightglue-onnx infer \
 </pre>
 </details>
 
-## Browser WebGPU demo
+## 🌐 Browser WebGPU demo
 
-Serve the static demo and open `http://localhost:8000` in a current Chromium browser:
+Serve the static demo and open `http://localhost:8000`:
 
 ```shell
 uvx static-http --directory web --port 8000 --localhost-only
 ```
 
-Select an exported static model and two images. The demo visualizes matches, reports adapter information when available, benchmarks steady-state execution, offers power-preference selection, and falls back to WebAssembly when WebGPU is unavailable.
+## ⏱️ Inference Speedup & Output Quality
+
+Benchmarks versus `torch.compile()` ([details here](https://fabio-sim.github.io/blog/gpt-5-6-sol-discovers-tensorrt-optimizations-raco-aliked-lightglue/)):
+
+<p align="center"><a href="https://fabio-sim.github.io/blog/gpt-5-6-sol-discovers-tensorrt-optimizations-raco-aliked-lightglue/"><img src="assets/postoptimization-speedup-heatmap.svg" alt="Raco-ALIKED-LightGlue+ Speedup" width=90%></a></p>
+
+<p align="center"><a href="https://fabio-sim.github.io/blog/gpt-5-6-sol-discovers-tensorrt-optimizations-raco-aliked-lightglue/"><img src="assets/postoptimization-match-quality.svg" alt="Raco-ALIKED-LightGlue+ Match Quality" width=90%></a></p>
+
+<p align="center"><a href="https://fabio-sim.github.io/blog/gpt-5-6-sol-discovers-tensorrt-optimizations-raco-aliked-lightglue/"><img src="assets/postoptimization-pareto-frontier.svg" alt="Raco-ALIKED-LightGlue+ Pareto Frontier" width=90%></a></p>
 
 ## Credits
 If you use any ideas from the papers or code in this repo, please consider citing the authors of [LightGlue](https://arxiv.org/abs/2306.13643) and [SuperPoint](https://arxiv.org/abs/1712.07629) and [DISK](https://arxiv.org/abs/2006.13566). Lastly, if the ONNX versions helped you in any way, please also consider starring this repository.
