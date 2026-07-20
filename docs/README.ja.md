@@ -182,10 +182,10 @@ uv run lightglue-onnx infer \
 
 ## 🌐 ブラウザー WebGPU デモ
 
-静的デモを配信し、`http://localhost:8000` を開きます：
+デモサーバーを起動し、`http://localhost:8000` を開きます：
 
 ```shell
-uvx static-http --directory web --port 8000 --localhost-only
+uv run python web/serve.py
 ```
 
 ## ⏱️ 推論速度と出力品質

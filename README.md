@@ -183,10 +183,10 @@ uv run lightglue-onnx infer \
 
 ## 🌐 Browser WebGPU demo
 
-Serve the static demo and open `http://localhost:8000`:
+Start the demo server and open `http://localhost:8000`:
 
 ```shell
-uvx static-http --directory web --port 8000 --localhost-only
+uv run python web/serve.py
 ```
 
 ## ⏱️ Inference Speedup & Output Quality
