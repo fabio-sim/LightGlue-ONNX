@@ -182,10 +182,10 @@ uv run lightglue-onnx infer \
 
 ## 🌐 浏览器 WebGPU 演示
 
-启动静态演示，然后打开 `http://localhost:8000`：
+启动演示服务器，然后打开 `http://localhost:8000`：
 
 ```shell
-uvx static-http --directory web --port 8000 --localhost-only
+uv run python web/serve.py
 ```
 
 ## ⏱️ 推理加速与输出质量

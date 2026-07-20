@@ -3,32 +3,152 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>RaCo + LightGlue+ WebGPU</title>
+    <meta name="theme-color" content="#121716" />
+    <title>RaCo–ALIKED–LightGlue+ WebGPU demo</title>
     <link rel="stylesheet" href="style.css" />
   </head>
   <body>
     <main>
-      <h1>RaCo + ALIKED + LightGlue+</h1>
-      <p>ONNX Runtime Web with WebGPU and a WebAssembly fallback. Covariance is not part of the model.</p>
-      <section class="controls">
-        <label>ONNX model <input id="model" type="file" accept=".onnx" /></label>
-        <label>Left image <input id="left" type="file" accept="image/*" /></label>
-        <label>Right image <input id="right" type="file" accept="image/*" /></label>
-        <label>Power preference
-          <select id="power">
-            <option value="default">default</option>
-            <option value="low-power">low-power</option>
-            <option value="high-performance">high-performance</option>
-          </select>
-        </label>
-        <label>Warmups <input id="warmup" type="number" min="0" value="3" /></label>
-        <label>Runs <input id="runs" type="number" min="1" value="20" /></label>
-        <button id="run">Load and benchmark</button>
+      <header class="hero">
+        <p class="eyebrow">ONNX RUNTIME WEB · WEBGPU</p>
+        <h1>RaCo–ALIKED–LightGlue+</h1>
+        <p class="lede">
+          Match image pairs in the browser with the optimized v3.0 release models. WebGPU is preferred;
+          WebAssembly remains available as a fallback.
+        </p>
+        <a class="release-link" href="https://github.com/fabio-sim/LightGlue-ONNX/releases/tag/v3.0">
+          View the v3.0 release
+        </a>
+      </header>
+
+      <section class="panel" aria-labelledby="configuration-heading">
+        <div class="section-heading">
+          <div>
+            <p class="section-index">01</p>
+            <h2 id="configuration-heading">Configure</h2>
+          </div>
+          <p id="readiness" class="readiness" aria-live="polite">Loading the sample pair…</p>
+        </div>
+
+        <div class="control-grid">
+          <label>
+            Model source
+            <select id="model-source">
+              <option value="release" selected>GitHub release v3.0</option>
+              <option value="local">Local ONNX file</option>
+            </select>
+          </label>
+
+          <label id="release-model-field">
+            Release model
+            <select id="release-model">
+              <option value="512" selected>K = 512 · fastest</option>
+              <option value="1024">K = 1,024</option>
+              <option value="1536">K = 1,536</option>
+              <option value="2048">K = 2,048</option>
+              <option value="2560">K = 2,560</option>
+              <option value="3072">K = 3,072</option>
+              <option value="3584">K = 3,584 · highest yield</option>
+            </select>
+          </label>
+
+          <label id="local-model-field" class="is-hidden">
+            Local model
+            <input id="local-model" type="file" accept=".onnx,application/octet-stream" />
+          </label>
+
+          <label>
+            Demo
+            <select id="demo-mode">
+              <option value="pair" selected>Marunouchi image pair</option>
+              <option value="rotation">Rotation sweep · same image</option>
+              <option value="custom">Custom image pair</option>
+            </select>
+          </label>
+
+          <label>
+            Input dimensions
+            <select id="resolution">
+              <option value="768x512" selected>768 × 512 · native 3:2</option>
+              <option value="512x512">512 × 512 · fast square</option>
+              <option value="768x768">768 × 768</option>
+              <option value="1024x1024">1,024 × 1,024</option>
+            </select>
+          </label>
+
+          <label>
+            Power preference
+            <select id="power">
+              <option value="default" selected>default</option>
+              <option value="low-power">low-power</option>
+              <option value="high-performance">high-performance</option>
+            </select>
+          </label>
+
+          <label>
+            Warmups
+            <input id="warmup" type="number" min="0" max="20" value="0" />
+          </label>
+
+          <label id="runs-field">
+            Benchmark runs
+            <input id="runs" type="number" min="1" max="100" value="1" />
+          </label>
+        </div>
+
+        <div id="custom-images" class="custom-images is-hidden">
+          <label>
+            Left image
+            <input id="left-file" type="file" accept="image/*" />
+          </label>
+          <label>
+            Right image
+            <input id="right-file" type="file" accept="image/*" />
+          </label>
+        </div>
+
+        <div class="actions">
+          <button id="run" class="primary" type="button" disabled>Load model &amp; run</button>
+          <button id="stop" type="button" disabled>Stop rotation</button>
+          <div class="progress-wrap" aria-live="polite">
+            <progress id="progress" max="1" value="0"></progress>
+            <span id="progress-label">Ready</span>
+          </div>
+        </div>
       </section>
-      <pre id="status">Select a static-shape RaCo ONNX model and two images.</pre>
-      <canvas id="matches"></canvas>
+
+      <section class="results" aria-labelledby="results-heading">
+        <div class="section-heading">
+          <div>
+            <p class="section-index">02</p>
+            <h2 id="results-heading">Matches</h2>
+          </div>
+          <p class="result-note">Rotation mode plots only matches inside the shared inscribed circle.</p>
+        </div>
+
+        <div class="metrics" aria-label="Inference summary">
+          <div><span>Provider</span><strong id="metric-provider">—</strong></div>
+          <div><span>Median</span><strong id="metric-median">—</strong></div>
+          <div><span>Matches</span><strong id="metric-matches">—</strong></div>
+          <div><span>Model</span><strong id="metric-model">—</strong></div>
+        </div>
+
+        <div class="canvas-shell">
+          <canvas id="matches" aria-label="Image pair with visualized feature matches"></canvas>
+          <div id="canvas-placeholder">The default Marunouchi pair will appear here.</div>
+        </div>
+
+        <details class="runtime-details">
+          <summary>Runtime details</summary>
+          <pre id="status">Waiting for the sample images.</pre>
+        </details>
+      </section>
     </main>
-    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/ort.webgpu.min.js"></script>
+
+    <script
+      crossorigin="anonymous"
+      src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.27.0/dist/ort.webgpu.min.js"
+    ></script>
     <script type="module" src="main.js"></script>
   </body>
 </html>
