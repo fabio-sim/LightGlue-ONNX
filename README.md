@@ -127,7 +127,7 @@ uv run lightglue-onnx infer \
 <pre>
 uv run lightglue-onnx infer \
   weights/raco_aliked_lightglue_pipeline_k1024.onnx \
-  data/marunouchi-left.jpg data/marunouchi-right.jpg \
+  assets/sacre_coeur1.jpg assets/sacre_coeur2.jpg \
   raco_aliked \
   -h 1024 -w 1024 \
   -d tensorrt --fp16 \
