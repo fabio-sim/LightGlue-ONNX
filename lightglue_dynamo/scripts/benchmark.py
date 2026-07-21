@@ -15,23 +15,29 @@ import threading
 import time
 from collections import defaultdict
 from collections.abc import Iterator, Mapping
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, Literal, Protocol, cast
 
-import cv2
 import numpy as np
 import typer
 
 from lightglue_dynamo.cli_utils import preload_nvidia_libraries
-from lightglue_dynamo.preprocessors import RaCoPreprocessor
+from lightglue_dynamo.preprocessors import (
+    CudaPreparedImages,
+    CudaRaCoPreprocessor,
+    RaCoPreprocessor,
+    prepare_host_images,
+)
 
 app = typer.Typer(no_args_is_help=True)
 
 Backend = Literal["pytorch", "torch-compile", "ort-cuda", "ort-tensorrt", "tensorrt"]
 Precision = Literal["fp32", "fp16"]
 CompileMode = Literal["default", "reduce-overhead", "max-autotune-no-cudagraphs", "max-autotune"]
+PreprocessingBackend = Literal["opencv", "cuda"]
 
 # `filter_matches` has a data-dependent output length. Dynamo first specializes
 # that length, then compiles generic, zero-length, and one-length variants as it
@@ -65,11 +71,26 @@ class InferenceResult:
     d2h_ms: float | None = None
 
 
+@dataclass
+class PreparedBenchmarkInput:
+    value: np.ndarray | CudaPreparedImages
+    original_shapes: tuple[tuple[int, int], tuple[int, int]]
+    preprocessing_ms: float
+    read_decode_ms: float | None
+    resize_ms: float | None
+    tensorize_ms: float | None
+    submission_ms: float | None
+
+    def release(self) -> None:
+        if isinstance(self.value, CudaPreparedImages):
+            self.value.release()
+
+
 class Executor(Protocol):
     initialization_ms: float
     compilation_ms: float | None
 
-    def infer(self, images: np.ndarray) -> InferenceResult: ...
+    def infer(self, images: np.ndarray | CudaPreparedImages) -> InferenceResult: ...
 
     def reset_memory(self) -> None: ...
 
@@ -167,16 +188,8 @@ def iter_pairs(dataset_root: Path, scene_info_root: Path) -> Iterator[Pair]:
 
 
 def _read_images(pair: Pair, size: int) -> tuple[np.ndarray, tuple[tuple[int, int], tuple[int, int]], float]:
-    start = time.perf_counter()
-    images = [cv2.imread(str(path), cv2.IMREAD_COLOR) for path in (pair.left, pair.right)]
-    if any(image is None for image in images):
-        raise FileNotFoundError(f"Failed to read {pair.left} or {pair.right}")
-    typed = cast(list[np.ndarray], images)
-    original_shapes = tuple((image.shape[0], image.shape[1]) for image in typed)
-    resized = np.stack([cv2.resize(image, (size, size), interpolation=cv2.INTER_AREA) for image in typed])
-    preprocessed = RaCoPreprocessor.preprocess(resized).astype(np.float32, copy=False)
-    elapsed_ms = (time.perf_counter() - start) * 1000
-    return preprocessed, cast(tuple[tuple[int, int], tuple[int, int]], original_shapes), elapsed_ms
+    prepared = prepare_host_images((pair.left, pair.right), size, size, RaCoPreprocessor)
+    return prepared.images, prepared.original_shapes, prepared.total_ms
 
 
 def _scaled_intrinsics(intrinsics: np.ndarray, original_shape: tuple[int, int], size: int) -> np.ndarray:
@@ -375,10 +388,13 @@ class OrtExecutor:
         self.compilation_ms = None
         self.input_dtype = np.float16 if self.session.get_inputs()[0].type == "tensor(float16)" else np.float32
 
-    def infer(self, images: np.ndarray) -> InferenceResult:
+    def infer(self, images: np.ndarray | CudaPreparedImages) -> InferenceResult:
         transfer_start = time.perf_counter()
-        feed = np.ascontiguousarray(images, dtype=self.input_dtype)
-        input_value = self.ort.OrtValue.ortvalue_from_numpy(feed, "cuda", 0)
+        if isinstance(images, CudaPreparedImages):
+            input_value = images.to_ort_value(self.ort)
+        else:
+            feed = np.ascontiguousarray(images, dtype=self.input_dtype)
+            input_value = self.ort.OrtValue.ortvalue_from_numpy(feed, "cuda", 0)
         binding = self.session.io_binding()
         binding.bind_ortvalue_input("images", input_value)
         for output in self.session.get_outputs():
@@ -534,12 +550,17 @@ def _percentiles(values: list[float]) -> dict[str, float] | None:
 def _summarize(records: list[dict[str, Any]], configuration: dict[str, Any]) -> dict[str, Any]:
     numeric_fields = [
         "preprocessing_ms",
+        "preprocessing_read_decode_ms",
+        "preprocessing_resize_ms",
+        "preprocessing_tensorize_ms",
+        "preprocessing_submission_ms",
         "h2d_ms",
         "inference_wall_ms",
         "device_ms",
         "d2h_ms",
         "executor_total_ms",
         "full_pipeline_ms",
+        "pipeline_iteration_ms",
         "match_count",
         "mscore_mean",
         "mscore_median",
@@ -645,6 +666,14 @@ def run(
     portable_deform_conv: Annotated[bool, typer.Option("--portable-deform-conv/--torchvision-deform-conv")] = False,
     cache_root: Annotated[Path, typer.Option(file_okay=False)] = Path("data/benchmark_cache"),
     ort_gpu_mem_limit_mib: Annotated[int, typer.Option(min=1)] = 9216,
+    preprocessing: Annotated[
+        PreprocessingBackend,
+        typer.Option(help="Image preprocessing backend. CUDA requires ORT CUDA/TensorRT and JPEG inputs."),
+    ] = "opencv",
+    prefetch: Annotated[
+        bool,
+        typer.Option("--prefetch/--no-prefetch", help="Overlap preparation of the next pair with current inference."),
+    ] = False,
 ) -> None:
     """Benchmark one resumable configuration over the canonical MegaDepth split."""
     os.environ.setdefault("NVIDIA_TF32_OVERRIDE", "0")
@@ -658,6 +687,8 @@ def run(
         input_type = onnx.load(model, load_external_data=False).graph.input[0].type.tensor_type.elem_type
         if input_type != onnx.TensorProto.FLOAT16:
             raise typer.BadParameter("ORT CUDA FP16 requires an FP16-converted ONNX model")
+    if preprocessing == "cuda" and backend not in {"ort-cuda", "ort-tensorrt"}:
+        raise typer.BadParameter("CUDA preprocessing currently supports the ORT CUDA and ORT TensorRT backends")
 
     configuration = {
         "backend": backend,
@@ -672,6 +703,8 @@ def run(
         "ort_graph_optimization_level": ("extended" if backend == "ort-cuda" and precision == "fp16" else "all")
         if backend.startswith("ort-")
         else None,
+        "preprocessing": preprocessing,
+        "prefetch": prefetch,
     }
     output.parent.mkdir(parents=True, exist_ok=True)
     records, completed = _completed_records(output, configuration)
@@ -684,7 +717,6 @@ def run(
     if len(pairs) != 1500:
         raise typer.BadParameter(f"Expected 1500 canonical pairs, found {len(pairs)}")
     warmup_pair = pairs[0]
-    warmup_images, _, _ = _read_images(warmup_pair, size)
     memory_baseline_mib = DeviceMemorySampler._read()
     executor = _create_executor(
         backend,
@@ -697,7 +729,36 @@ def run(
         cache=cache,
         ort_gpu_mem_limit_mib=ort_gpu_mem_limit_mib,
     )
+    cuda_preprocessor: CudaRaCoPreprocessor | None = None
+    if preprocessing == "cuda":
+        if not isinstance(executor, OrtExecutor):
+            raise RuntimeError("CUDA preprocessing requires an ORT executor")
+        input_dtype = "float16" if executor.input_dtype == np.float16 else "float32"
+        cuda_preprocessor = CudaRaCoPreprocessor(size, size, dtype=input_dtype, slots=2 if prefetch else 1)
+
+    def prepare_pair(pair: Pair) -> PreparedBenchmarkInput:
+        if cuda_preprocessor is not None:
+            value = cuda_preprocessor.prepare((pair.left, pair.right))
+            preprocessing_ms = value.synchronize()
+            return PreparedBenchmarkInput(
+                value, value.original_shapes, preprocessing_ms, None, None, None, value.submission_ms
+            )
+        value = prepare_host_images((pair.left, pair.right), size, size, RaCoPreprocessor)
+        return PreparedBenchmarkInput(
+            value.images,
+            value.original_shapes,
+            value.total_ms,
+            value.read_decode_ms,
+            value.resize_ms,
+            value.tensorize_ms,
+            None,
+        )
+
+    warmup_input = prepare_pair(warmup_pair)
+    warmup_images = warmup_input.value
     if isinstance(executor, TorchExecutor):
+        if not isinstance(warmup_images, np.ndarray):
+            raise RuntimeError("Torch compilation requires host preprocessing")
         executor.compile(warmup_images)
     first_inference_start = time.perf_counter()
     executor.infer(warmup_images)
@@ -706,8 +767,9 @@ def run(
     if isinstance(executor, TorchExecutor) and backend == "torch-compile":
         stabilization_start = time.perf_counter()
         for pair_index in TORCH_COMPILE_STABILIZATION_PAIRS:
-            stabilization_images, _, _ = _read_images(pairs[pair_index], size)
-            executor.infer(stabilization_images)
+            stabilization_input = prepare_pair(pairs[pair_index])
+            executor.infer(stabilization_input.value)
+            stabilization_input.release()
         compile_stabilization_ms = (time.perf_counter() - stabilization_start) * 1000
     for _ in range(warmup):
         executor.infer(warmup_images)
@@ -737,13 +799,24 @@ def run(
         "memory_scope": "PyTorch allocator peak for PyTorch; device-wide nvidia-smi high-water for other executors",
     }
     meta_path.write_text(json.dumps(meta, indent=2) + "\n")
+    warmup_input.release()
+    pool: ThreadPoolExecutor | None = None
     try:
         with output.open("a") as stream:
-            for pair in pairs[:expected_pairs]:
-                if pair.index in completed:
-                    continue
-                images, original_shapes, preprocessing_ms = _read_images(pair, size)
-                result = executor.infer(images)
+            pending_pairs = [pair for pair in pairs[:expected_pairs] if pair.index not in completed]
+            pool = ThreadPoolExecutor(max_workers=1) if prefetch and pending_pairs else None
+            future: Future[PreparedBenchmarkInput] | None = (
+                pool.submit(prepare_pair, pending_pairs[0]) if pool is not None else None
+            )
+            for position, pair in enumerate(pending_pairs):
+                iteration_start = time.perf_counter()
+                prepared = future.result() if future is not None else prepare_pair(pair)
+                if pool is not None and position + 1 < len(pending_pairs):
+                    future = pool.submit(prepare_pair, pending_pairs[position + 1])
+                else:
+                    future = None
+                result = executor.infer(prepared.value)
+                pipeline_iteration_ms = (time.perf_counter() - iteration_start) * 1000
                 record = {
                     "pair_index": pair.index,
                     "group": pair.group,
@@ -751,18 +824,26 @@ def run(
                     "left": str(pair.left),
                     "right": str(pair.right),
                     "overlap": pair.overlap,
-                    "preprocessing_ms": preprocessing_ms,
+                    "preprocessing_ms": prepared.preprocessing_ms,
+                    "preprocessing_read_decode_ms": prepared.read_decode_ms,
+                    "preprocessing_resize_ms": prepared.resize_ms,
+                    "preprocessing_tensorize_ms": prepared.tensorize_ms,
+                    "preprocessing_submission_ms": prepared.submission_ms,
                     "h2d_ms": result.h2d_ms,
                     "inference_wall_ms": result.wall_ms,
                     "device_ms": result.device_ms,
                     "d2h_ms": result.d2h_ms,
                     "executor_total_ms": result.wall_ms + (result.h2d_ms or 0.0) + (result.d2h_ms or 0.0),
-                    "full_pipeline_ms": preprocessing_ms
+                    "full_pipeline_ms": prepared.preprocessing_ms
                     + result.wall_ms
                     + (result.h2d_ms or 0.0)
                     + (result.d2h_ms or 0.0),
-                    **_match_metrics(pair, original_shapes, size, result.keypoints, result.matches, result.mscores),
+                    "pipeline_iteration_ms": pipeline_iteration_ms,
+                    **_match_metrics(
+                        pair, prepared.original_shapes, size, result.keypoints, result.matches, result.mscores
+                    ),
                 }
+                prepared.release()
                 stream.write(json.dumps(record, separators=(",", ":")) + "\n")
                 stream.flush()
                 records.append(record)
@@ -771,6 +852,10 @@ def run(
                     f"wall={result.wall_ms:.2f} ms matches={record['match_count']}"
                 )
     finally:
+        if pool is not None:
+            pool.shutdown(wait=True, cancel_futures=True)
+        if cuda_preprocessor is not None:
+            cuda_preprocessor.close()
         executor.close()
     meta.update(
         {
@@ -829,12 +914,16 @@ def matrix(
     ] = False,
     warmup: Annotated[int, typer.Option(min=0)] = 10,
     max_pairs: Annotated[int, typer.Option(min=0)] = 0,
+    preprocessing: Annotated[PreprocessingBackend, typer.Option()] = "opencv",
+    prefetch: Annotated[bool, typer.Option("--prefetch/--no-prefetch")] = False,
 ) -> None:
     """Export dynamic models and run the requested benchmark matrix in isolated processes."""
     selected_backends = [item for item in backends.split(",") if item]
     valid_backends = {"pytorch", "torch-compile", "ort-cuda", "ort-tensorrt", "tensorrt"}
     if not selected_backends or any(item not in valid_backends for item in selected_backends):
         raise typer.BadParameter(f"backends must come from {sorted(valid_backends)}")
+    if preprocessing == "cuda" and any(backend not in {"ort-cuda", "ort-tensorrt"} for backend in selected_backends):
+        raise typer.BadParameter("CUDA preprocessing matrix runs only support ORT CUDA and ORT TensorRT")
     selected_precisions = [item for item in precisions.split(",") if item]
     if not selected_precisions or any(item not in {"fp32", "fp16"} for item in selected_precisions):
         raise typer.BadParameter("precisions must contain fp32 and/or fp16")
@@ -904,7 +993,12 @@ def matrix(
                 for size in selected_sizes:
                     for compile_mode in modes:
                         suffix = f"-{compile_mode}" if compile_mode is not None else ""
-                        stem = f"{backend}-{precision}-s{size}-k{num_keypoints}{suffix}"
+                        preprocessing_suffix = (
+                            ""
+                            if preprocessing == "opencv" and not prefetch
+                            else f"-prep-{preprocessing}{'-prefetch' if prefetch else ''}"
+                        )
+                        stem = f"{backend}-{precision}-s{size}-k{num_keypoints}{suffix}{preprocessing_suffix}"
                         output = results_root / f"{stem}.jsonl"
                         summary_path = output.with_suffix(".summary.json")
                         expected_pairs = max_pairs or 1500
@@ -935,7 +1029,10 @@ def matrix(
                             str(max_pairs),
                             "--cache-root",
                             str(cache_root),
+                            "--preprocessing",
+                            preprocessing,
                         ]
+                        command.append("--prefetch" if prefetch else "--no-prefetch")
                         if backend == "torch-compile" and compile_mode is not None:
                             command.extend(["--compile-mode", compile_mode])
                         if backend.startswith("ort-") or backend == "tensorrt":

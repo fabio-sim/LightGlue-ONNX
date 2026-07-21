@@ -155,6 +155,15 @@ def test_raco_preprocessor_is_rgb_float32() -> None:
     np.testing.assert_allclose(result[0, :, 0, 0], np.asarray([1, 127 / 255, 0], dtype=np.float32))
 
 
+def test_raco_preprocessor_is_contiguous_and_matches_reference() -> None:
+    rng = np.random.default_rng(13)
+    bgr = rng.integers(0, 256, size=(2, 3, 17, 23, 3), dtype=np.uint8)
+    expected = np.ascontiguousarray((bgr[..., ::-1].astype(np.float32) / np.float32(255)).transpose(0, 1, 4, 2, 3))
+    result = RaCoPreprocessor.preprocess(bgr)
+    assert result.flags.c_contiguous
+    np.testing.assert_allclose(result, expected, atol=np.finfo(np.float32).eps, rtol=0)
+
+
 def test_raco_pipeline_uses_universal_output_contract() -> None:
     assert Extractor.raco_aliked.value == "raco_aliked"
     outputs = Pipeline(_ExtractorWithMetadata(), _Matcher())(torch.zeros(2, 3, 32, 32))

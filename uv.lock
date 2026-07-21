@@ -208,6 +208,18 @@ nvtx = [
 ]
 
 [[package]]
+name = "cvcuda-cu13"
+version = "0.16.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy", marker = "sys_platform != 'darwin' or extra != 'extra-14-lightglue-onnx-torch-cpu' or (extra == 'extra-14-lightglue-onnx-torch-cpu' and extra == 'extra-14-lightglue-onnx-torch-cuda') or (extra == 'extra-14-lightglue-onnx-torch-cpu' and extra == 'group-14-lightglue-onnx-cpu' and extra == 'group-14-lightglue-onnx-cuda')" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b3/51/ca92535c56f2901dc42c1129b745fd44578a03ffbf9b14ab02c694aef4f6/cvcuda_cu13-0.16.0-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:1620f97065e1444b80a536c9d1539f3ec4f22c462487b155270c2681b82e7aea", size = 102940903, upload-time = "2025-11-17T20:45:51.132Z" },
+    { url = "https://files.pythonhosted.org/packages/e9/be/bc5ec5ede85b566b4d214dfa9c13c9e81c8f29a252d712ea9637e3ff7266/cvcuda_cu13-0.16.0-py3-none-manylinux_2_27_aarch64.whl", hash = "sha256:0b6f7cb433c506609ed22fcf08e3d323ef5111cba61def510a6caddc764fed43", size = 115548040, upload-time = "2025-11-19T23:26:31.189Z" },
+]
+
+[[package]]
 name = "cycler"
 version = "0.12.1"
 source = { registry = "https://pypi.org/simple" }
@@ -435,6 +447,10 @@ export = [
     { name = "onnx" },
     { name = "onnxscript" },
 ]
+gpu-preprocess = [
+    { name = "cvcuda-cu13", marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-14-lightglue-onnx-torch-cpu' and extra == 'extra-14-lightglue-onnx-torch-cuda') or (platform_machine != 'x86_64' and extra == 'group-14-lightglue-onnx-cpu' and extra == 'group-14-lightglue-onnx-cuda') or (sys_platform != 'linux' and extra == 'extra-14-lightglue-onnx-torch-cpu' and extra == 'extra-14-lightglue-onnx-torch-cuda') or (sys_platform != 'linux' and extra != 'extra-14-lightglue-onnx-torch-cuda' and extra == 'group-14-lightglue-onnx-cpu' and extra == 'group-14-lightglue-onnx-cuda') or (sys_platform != 'linux' and extra != 'extra-14-lightglue-onnx-torch-cpu' and extra == 'group-14-lightglue-onnx-cpu' and extra == 'group-14-lightglue-onnx-cuda')" },
+    { name = "nvidia-nvimgcodec-cu13", extra = ["nvjpeg"], marker = "(platform_machine == 'x86_64' and sys_platform == 'linux') or (platform_machine != 'x86_64' and extra == 'extra-14-lightglue-onnx-torch-cpu' and extra == 'extra-14-lightglue-onnx-torch-cuda') or (platform_machine != 'x86_64' and extra == 'group-14-lightglue-onnx-cpu' and extra == 'group-14-lightglue-onnx-cuda') or (sys_platform != 'linux' and extra == 'extra-14-lightglue-onnx-torch-cpu' and extra == 'extra-14-lightglue-onnx-torch-cuda') or (sys_platform != 'linux' and extra != 'extra-14-lightglue-onnx-torch-cuda' and extra == 'group-14-lightglue-onnx-cpu' and extra == 'group-14-lightglue-onnx-cuda') or (sys_platform != 'linux' and extra != 'extra-14-lightglue-onnx-torch-cpu' and extra == 'group-14-lightglue-onnx-cpu' and extra == 'group-14-lightglue-onnx-cuda')" },
+]
 lint = [
     { name = "ruff" },
 ]
@@ -472,6 +488,10 @@ cuda = [
 export = [
     { name = "onnx", specifier = "==1.22.0" },
     { name = "onnxscript", specifier = "==0.7.1" },
+]
+gpu-preprocess = [
+    { name = "cvcuda-cu13", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==0.16.0" },
+    { name = "nvidia-nvimgcodec-cu13", extras = ["nvjpeg"], marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==0.9.0.20" },
 ]
 lint = [{ name = "ruff", specifier = "==0.15.21" }]
 test = [
@@ -864,6 +884,21 @@ wheels = [
 ]
 
 [[package]]
+name = "nvidia-nvimgcodec-cu13"
+version = "0.9.0.20"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/1e/d1/4374efbfddfe9f0229f12be20baec79e825d9ab24b7ee0ea840130e72161/nvidia_nvimgcodec_cu13-0.9.0.20-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:2be8a4eb90f092bb7f21321d75c0f6bb48df412055e16eddedc2a55348f4936c", size = 23645131, upload-time = "2026-07-14T17:42:45.684Z" },
+    { url = "https://files.pythonhosted.org/packages/29/56/f0c9e0f5f7f8e99aa85dcf11dfb0f6142651640dc80d8fcefd0093dbd96c/nvidia_nvimgcodec_cu13-0.9.0.20-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:b59bbb223d11065abb7da81e27a2015d15db5d5535639cdc5050e4154a00800a", size = 25044224, upload-time = "2026-07-14T17:43:02.903Z" },
+    { url = "https://files.pythonhosted.org/packages/6a/8c/7ce9e5962fd7534aa99ff6be18142038e92e64c32fe6092f742ea52d8821/nvidia_nvimgcodec_cu13-0.9.0.20-py3-none-win_amd64.whl", hash = "sha256:dc613efa84998823bbbb20ec1bfc39b4b316c3cd08f729c3ae6e5f77d8670f1e", size = 11965615, upload-time = "2026-07-14T17:43:25.379Z" },
+]
+
+[package.optional-dependencies]
+nvjpeg = [
+    { name = "nvidia-nvjpeg", marker = "sys_platform != 'darwin' or extra != 'extra-14-lightglue-onnx-torch-cpu' or (extra == 'extra-14-lightglue-onnx-torch-cpu' and extra == 'extra-14-lightglue-onnx-torch-cuda') or (extra == 'extra-14-lightglue-onnx-torch-cpu' and extra == 'group-14-lightglue-onnx-cpu' and extra == 'group-14-lightglue-onnx-cuda')" },
+]
+
+[[package]]
 name = "nvidia-nvjitlink"
 version = "13.3.33"
 source = { registry = "https://pypi.org/simple" }
@@ -871,6 +906,16 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/f0/ee/580ca6f29dcab0221db8706badca1bbbb084f1975c4d4e83329c3a7e31f0/nvidia_nvjitlink-13.3.33-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl", hash = "sha256:26a6de7fb4c8fdaa7703d3dad720d6d427ddfea5c48a528fd97c11733ad830e5", size = 40742423, upload-time = "2026-05-26T16:54:51.613Z" },
     { url = "https://files.pythonhosted.org/packages/69/30/45414e35ff2eee7db3da037e5707037ccf9d2b5218ffbdb055ea4d5aa98a/nvidia_nvjitlink-13.3.33-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:ce48b37dfeb3cb1eae4cf85adacb47d7a6539ea2272870c9a3628ce275c2037e", size = 39168635, upload-time = "2026-05-26T16:54:13.906Z" },
     { url = "https://files.pythonhosted.org/packages/67/f2/ec9c05a108095828dfc58840978c627b3c313fdf2a567c6de9ffbbb46901/nvidia_nvjitlink-13.3.33-py3-none-win_amd64.whl", hash = "sha256:4297ee49639b4f2e07255a1d69b3acc7ab2d011bb892b403e91ac98368962e3b", size = 37766359, upload-time = "2026-05-26T17:11:28.96Z" },
+]
+
+[[package]]
+name = "nvidia-nvjpeg"
+version = "13.2.1.68"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a5/37/f86e25f87685670a408dcb67bfa21689364beab20a651f9152eb3f15c83c/nvidia_nvjpeg-13.2.1.68-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:e3f0d88b7e8b952919a954d67e5c7935ffcd27ddcaec76da8619b463e241a9d6", size = 3773238, upload-time = "2026-06-29T17:05:40.476Z" },
+    { url = "https://files.pythonhosted.org/packages/19/c1/3bcd9ff62c3b90a4ed858c4c865c8bf80f2db4542181cabda3094410ec30/nvidia_nvjpeg-13.2.1.68-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:2c292f2219909bfcc56f2184dd134b7c7dd65bafa7247f3287e26ef42dbd1453", size = 3835035, upload-time = "2026-06-29T17:06:13.12Z" },
+    { url = "https://files.pythonhosted.org/packages/b6/99/03f3ce7bd32bc0bf6f1d383d8ab7170f5f6a4e715a2c5e611ad72616b229/nvidia_nvjpeg-13.2.1.68-py3-none-win_amd64.whl", hash = "sha256:22396d67132217c47b33341df103202693fc1095fa44c8432e6adc3c7dd963b7", size = 3209950, upload-time = "2026-06-29T17:20:43.895Z" },
 ]
 
 [[package]]

@@ -35,6 +35,10 @@ cuda = [
     "nvidia-cudnn-cu13==9.20.0.48; platform_system == 'Linux' and platform_machine == 'x86_64'",
     "onnxruntime-gpu==1.27.0; platform_system == 'Linux' and platform_machine == 'x86_64'",
 ]
+gpu-preprocess = [
+    "cvcuda-cu13==0.16.0; platform_system == 'Linux' and platform_machine == 'x86_64'",
+    "nvidia-nvimgcodec-cu13[nvjpeg]==0.9.0.20; platform_system == 'Linux' and platform_machine == 'x86_64'",
+]
 export = [
     "onnx==1.22.0",
     "onnxscript==0.7.1",

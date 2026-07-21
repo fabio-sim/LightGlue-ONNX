@@ -64,6 +64,12 @@ TensorRT CLI 対応：
 uv sync --no-group cpu --group cuda --group export --group trt --extra torch-cuda
 ```
 
+推論向けのオプション GPU JPEG 前処理（Linux x86-64、CUDA/TensorRT）：
+
+```shell
+uv sync --no-group cpu --group cuda --group trt --group gpu-preprocess
+```
+
 ```shell
 $ uv run lightglue-onnx --help
 
@@ -119,11 +125,12 @@ uv run lightglue-onnx infer \
 <summary>🚀 ONNX Runtime 推論 (TensorRT)</summary>
 <pre>
 uv run lightglue-onnx infer \
-  weights/superpoint_lightglue_pipeline.trt.onnx \
-  assets/sacre_coeur1.jpg assets/sacre_coeur2.jpg \
-  superpoint \
+  weights/raco_aliked_lightglue_pipeline_k1024.onnx \
+  data/marunouchi-left.jpg data/marunouchi-right.jpg \
+  raco_aliked \
   -h 1024 -w 1024 \
-  -d tensorrt --fp16
+  -d tensorrt --fp16 \
+  --preprocessing cuda  # オプション
 </pre>
 </details>
 
