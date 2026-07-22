@@ -7,6 +7,7 @@ from typing import cast
 
 import cv2
 import numpy as np
+from numpy.typing import DTypeLike
 
 from .base import PreprocessorBase
 
@@ -23,7 +24,13 @@ class HostPreparedImages:
 
 
 def prepare_host_images(
-    paths: tuple[Path, Path], width: int, height: int, preprocessor: type[PreprocessorBase]
+    paths: tuple[Path, Path],
+    width: int,
+    height: int,
+    preprocessor: type[PreprocessorBase],
+    *,
+    interpolation: int = cv2.INTER_LINEAR,
+    dtype: DTypeLike = np.float32,
 ) -> HostPreparedImages:
     """Read, resize, and pack an image pair for a pipeline model."""
     start = time.perf_counter()
@@ -35,12 +42,12 @@ def prepare_host_images(
     original_shapes = cast(
         tuple[tuple[int, int], tuple[int, int]], tuple((image.shape[0], image.shape[1]) for image in typed)
     )
-    resized = [cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA) for image in typed]
+    resized = [cv2.resize(image, (width, height), interpolation=interpolation) for image in typed]
     resize_end = time.perf_counter()
-    images = preprocessor.preprocess(np.stack(resized))
+    images = np.ascontiguousarray(preprocessor.preprocess(np.stack(resized)), dtype=dtype)
     tensorize_end = time.perf_counter()
     return HostPreparedImages(
-        images=np.ascontiguousarray(images),
+        images=images,
         resized_bgr=resized,
         original_shapes=original_shapes,
         read_decode_ms=(read_end - start) * 1000,

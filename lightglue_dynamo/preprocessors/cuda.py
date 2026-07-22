@@ -4,6 +4,8 @@ import os
 import site
 import tempfile
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
@@ -23,26 +25,39 @@ class OrtModule(Protocol):
     OrtValue: _OrtValueFactory
 
 
-def _limit_nvimgcodec_extensions_to_jpeg() -> None:
-    """Avoid loading optional codec plugins whose libraries are not installed."""
+@contextmanager
+def _jpeg_only_nvimgcodec_extensions() -> Iterator[None]:
+    """Temporarily select installed JPEG plugins without changing the caller's environment."""
     global _EXTENSION_DIRECTORY
-    if os.environ.get("NVIMGCODEC_EXTENSIONS_PATH") or _EXTENSION_DIRECTORY is not None:
+    if "NVIMGCODEC_EXTENSIONS_PATH" in os.environ:
+        yield
         return
-    roots = [Path(path) for path in [*site.getsitepackages(), site.getusersitepackages()] if path]
-    extension_root = next(
-        (root / "nvidia/nvimgcodec/extensions" for root in roots if (root / "nvidia/nvimgcodec/extensions").is_dir()),
-        None,
-    )
-    if extension_root is None:
-        return
-    _EXTENSION_DIRECTORY = tempfile.TemporaryDirectory(prefix="lightglue-nvimgcodec-")
+    if _EXTENSION_DIRECTORY is None:
+        roots = [Path(path) for path in [*site.getsitepackages(), site.getusersitepackages()] if path]
+        extension_root = next(
+            (
+                root / "nvidia/nvimgcodec/extensions"
+                for root in roots
+                if (root / "nvidia/nvimgcodec/extensions").is_dir()
+            ),
+            None,
+        )
+        if extension_root is None:
+            yield
+            return
+        _EXTENSION_DIRECTORY = tempfile.TemporaryDirectory(prefix="lightglue-nvimgcodec-")
+        destination = Path(_EXTENSION_DIRECTORY.name)
+        for pattern in ("libnvjpeg_ext.so*", "libjpeg_turbo_ext.so*"):
+            for source in extension_root.glob(pattern):
+                target = destination / source.name
+                if not target.exists():
+                    target.symlink_to(source)
     destination = Path(_EXTENSION_DIRECTORY.name)
-    for pattern in ("libnvjpeg_ext.so*", "libjpeg_turbo_ext.so*"):
-        for source in extension_root.glob(pattern):
-            target = destination / source.name
-            if not target.exists():
-                target.symlink_to(source)
     os.environ["NVIMGCODEC_EXTENSIONS_PATH"] = str(destination)
+    try:
+        yield
+    finally:
+        os.environ.pop("NVIMGCODEC_EXTENSIONS_PATH", None)
 
 
 @dataclass
@@ -115,38 +130,38 @@ class CudaRaCoPreprocessor:
                 "CUDA preprocessing currently requires a float32 ONNX input. TensorRT FP16 is supported because "
                 "TensorRT keeps the model boundary in float32 and selects FP16 internally."
             )
-        _limit_nvimgcodec_extensions_to_jpeg()
         preload_nvidia_libraries(image_codec=True)
-        try:
-            import cvcuda
-            from nvidia import nvimgcodec
-        except ImportError as exc:
-            raise RuntimeError(
-                "CUDA preprocessing requires the gpu-preprocess dependency group: "
-                "uv sync --no-default-groups --group cuda --group gpu-preprocess"
-            ) from exc
+        with _jpeg_only_nvimgcodec_extensions():
+            try:
+                import cvcuda
+                from nvidia import nvimgcodec
+            except ImportError as exc:
+                raise RuntimeError(
+                    "CUDA preprocessing requires the gpu-preprocess dependency group: "
+                    "uv sync --no-default-groups --group cuda --group gpu-preprocess"
+                ) from exc
 
-        self.cvcuda = cvcuda
-        self.nvimgcodec = nvimgcodec
-        self.width = width
-        self.height = height
-        self.dtype = dtype
-        output_type = cvcuda.Type.F32
-        backends = [nvimgcodec.Backend(nvimgcodec.BackendKind.HYBRID_CPU_GPU)]
-        self.slots: list[_CudaPreprocessSlot] = []
-        for _ in range(slots):
-            stream = cvcuda.Stream()
-            resized = [cvcuda.Tensor((height, width, 3), cvcuda.Type.U8, "HWC") for _ in range(2)]
-            self.slots.append(
-                _CudaPreprocessSlot(
-                    stream=stream,
-                    decoder=nvimgcodec.Decoder(backends=backends, options=":num_cuda_streams=1"),
-                    resized=resized,
-                    stacked=cvcuda.Tensor((2, height, width, 3), cvcuda.Type.U8, "NHWC"),
-                    scaled=cvcuda.Tensor((2, height, width, 3), output_type, "NHWC"),
-                    output=cvcuda.Tensor((2, 3, height, width), output_type, "NCHW"),
+            self.cvcuda = cvcuda
+            self.nvimgcodec = nvimgcodec
+            self.width = width
+            self.height = height
+            self.dtype = dtype
+            output_type = cvcuda.Type.F32
+            backends = [nvimgcodec.Backend(nvimgcodec.BackendKind.HYBRID_CPU_GPU)]
+            self.slots: list[_CudaPreprocessSlot] = []
+            for _ in range(slots):
+                stream = cvcuda.Stream()
+                resized = [cvcuda.Tensor((height, width, 3), cvcuda.Type.U8, "HWC") for _ in range(2)]
+                self.slots.append(
+                    _CudaPreprocessSlot(
+                        stream=stream,
+                        decoder=nvimgcodec.Decoder(backends=backends, options=":num_cuda_streams=1"),
+                        resized=resized,
+                        stacked=cvcuda.Tensor((2, height, width, 3), cvcuda.Type.U8, "NHWC"),
+                        scaled=cvcuda.Tensor((2, height, width, 3), output_type, "NHWC"),
+                        output=cvcuda.Tensor((2, 3, height, width), output_type, "NCHW"),
+                    )
                 )
-            )
 
     def prepare(self, paths: tuple[Path, Path]) -> CudaPreparedImages:
         if any(path.suffix.lower() not in {".jpg", ".jpeg"} for path in paths):

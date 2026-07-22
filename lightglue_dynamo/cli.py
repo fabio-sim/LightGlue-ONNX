@@ -224,12 +224,16 @@ def infer(
             Extractor.raco_aliked: RaCoPreprocessor,
         }[extractor_type]
         try:
-            host_prepared = prepare_host_images((left_image_path, right_image_path), width, height, preprocessor)
+            host_prepared = prepare_host_images(
+                (left_image_path, right_image_path),
+                width,
+                height,
+                preprocessor,
+                dtype=np.float16 if fp16 and device != InferenceDevice.tensorrt else np.float32,
+            )
         except FileNotFoundError as exc:
             raise typer.BadParameter(str(exc)) from exc
-        images = host_prepared.images.astype(
-            np.float16 if fp16 and device != InferenceDevice.tensorrt else np.float32, copy=False
-        )
+        images = host_prepared.images
 
     if device in {InferenceDevice.cuda, InferenceDevice.tensorrt}:
         preload = getattr(ort, "preload_dlls", None)
@@ -432,11 +436,13 @@ def trtexec(
         Extractor.raco_aliked: RaCoPreprocessor,
     }[extractor_type]
     try:
-        prepared = prepare_host_images((left_image_path, right_image_path), width, height, preprocessor)
+        prepared = prepare_host_images(
+            (left_image_path, right_image_path), width, height, preprocessor, dtype=np.float32
+        )
     except FileNotFoundError as exc:
         raise typer.BadParameter(str(exc)) from exc
     raw_images = prepared.resized_bgr
-    images = prepared.images.astype(np.float32, copy=False)
+    images = prepared.images
 
     if strongly_typed and precision_constraints.lower() != "none":
         raise typer.BadParameter("precision-constraints must be 'none' when --strongly-typed is set.")

@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import cv2
@@ -13,7 +14,8 @@ def test_cuda_raco_preprocessor_rejects_fp16_model_input() -> None:
 
 
 @pytest.mark.parametrize("size", [128, 1024])
-def test_cuda_raco_preprocessor_produces_device_ortvalue(size: int) -> None:
+def test_cuda_raco_preprocessor_produces_device_ortvalue(size: int, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("NVIMGCODEC_EXTENSIONS_PATH", raising=False)
     pytest.importorskip("cvcuda")
     from lightglue_dynamo.cli_utils import preload_nvidia_libraries
 
@@ -27,6 +29,7 @@ def test_cuda_raco_preprocessor_produces_device_ortvalue(size: int) -> None:
     root = Path(__file__).resolve().parents[1]
     paths = (root / "assets/sacre_coeur1.jpg", root / "assets/sacre_coeur2.jpg")
     preprocessor = CudaRaCoPreprocessor(size, size)
+    assert "NVIMGCODEC_EXTENSIONS_PATH" not in os.environ
     prepared = preprocessor.prepare(paths)
     try:
         value = prepared.to_ort_value(ort)

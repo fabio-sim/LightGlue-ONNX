@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, Literal, Protocol, cast
 
+import cv2
 import numpy as np
 import typer
 
@@ -188,7 +189,9 @@ def iter_pairs(dataset_root: Path, scene_info_root: Path) -> Iterator[Pair]:
 
 
 def _read_images(pair: Pair, size: int) -> tuple[np.ndarray, tuple[tuple[int, int], tuple[int, int]], float]:
-    prepared = prepare_host_images((pair.left, pair.right), size, size, RaCoPreprocessor)
+    prepared = prepare_host_images(
+        (pair.left, pair.right), size, size, RaCoPreprocessor, interpolation=cv2.INTER_AREA, dtype=np.float32
+    )
     return prepared.images, prepared.original_shapes, prepared.total_ms
 
 
@@ -743,7 +746,9 @@ def run(
             return PreparedBenchmarkInput(
                 value, value.original_shapes, preprocessing_ms, None, None, None, value.submission_ms
             )
-        value = prepare_host_images((pair.left, pair.right), size, size, RaCoPreprocessor)
+        value = prepare_host_images(
+            (pair.left, pair.right), size, size, RaCoPreprocessor, interpolation=cv2.INTER_AREA, dtype=np.float32
+        )
         return PreparedBenchmarkInput(
             value.images,
             value.original_shapes,
