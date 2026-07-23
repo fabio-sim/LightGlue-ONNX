@@ -199,7 +199,9 @@ class RaCo(nn.Module):
             if isinstance(module, (ConvBlock, ResBlock)):
                 module.fuse_batch_norm()
 
-    def forward(self, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _candidate_keypoints(
+        self, image: torch.Tensor, count: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         image = (image - self.image_mean) / self.image_std
 
         x1 = self.block1(image)
@@ -216,7 +218,6 @@ class RaCo(nn.Module):
             dim=1,
         )
         logits = self.score_head(features)
-        ranker_map = self.ranker_head(image)
         # Spatial softmax is strictly monotonic, so local maxima and their
         # ordering can be selected directly from logits. Keep probability
         # computation after selection: standalone RaCo still returns detection
@@ -224,15 +225,23 @@ class RaCo(nn.Module):
         # otherwise unused full-resolution branch.
         nms = F.max_pool2d(logits, self.nms_radius, stride=1, padding=self.nms_radius // 2)
         logits_nms = torch.where(logits == nms, logits, -torch.inf)
-        _top_values, top_indices = _chunked_topk(
-            logits_nms.flatten(1), self.num_candidates, self.topk_chunk_size
-        )
+        _top_values, top_indices = _chunked_topk(logits_nms.flatten(1), count, self.topk_chunk_size)
         width = shape_as_tensor(logits)[-1]
         x = torch.remainder(top_indices, width)
         y = torch.div(top_indices, width, rounding_mode="floor")
         keypoints = torch.stack((x, y), dim=-1).to(logits.dtype)
         if self.subpixel_sampling:
             keypoints = keypoints + _subpixel_offsets(logits, top_indices, self.nms_radius, self.subpixel_temperature)
+        return image, keypoints, logits
+
+    def extract_unranked(self, image: torch.Tensor) -> torch.Tensor:
+        """Select detector keypoints directly for an experimental matching fast path."""
+        _normalized_image, keypoints, _logits = self._candidate_keypoints(image, self.num_keypoints)
+        return keypoints + 0.5
+
+    def forward(self, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        image, keypoints, logits = self._candidate_keypoints(image, self.num_candidates)
+        ranker_map = self.ranker_head(image)
         probabilities = F.softmax(logits.flatten(1), dim=1).reshape_as(logits)
         detection_scores = _sample(probabilities, keypoints)
         ranker_scores = _sample(ranker_map, keypoints)

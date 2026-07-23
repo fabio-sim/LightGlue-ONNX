@@ -46,6 +46,13 @@ def export(
             help="Decompose ALIKED DeformConv for TensorRT and WebGPU portability.",
         ),
     ] = True,
+    bypass_ranker: Annotated[
+        bool,
+        typer.Option(
+            "--bypass-ranker",
+            help="Skip the RaCo rotation-aware ranker and select keypoints by detector score.",
+        ),
+    ] = False,
     fp16: Annotated[bool, typer.Option("--fp16", help="Whether to also convert to FP16.")] = False,
 ) -> None:
     """Export LightGlue to ONNX."""
@@ -56,6 +63,9 @@ def export(
 
     from lightglue_dynamo.models import DISK, LightGlue, Pipeline, RaCoALIKED, SuperPoint
 
+    if bypass_ranker and extractor_type != Extractor.raco_aliked:
+        raise typer.BadParameter("--bypass-ranker is only supported for the raco_aliked extractor")
+
     match extractor_type:
         case Extractor.superpoint:
             extractor = SuperPoint(num_keypoints=num_keypoints)
@@ -64,7 +74,11 @@ def export(
         case Extractor.raco_aliked:
             if opset < 20:
                 raise typer.BadParameter("raco_aliked export requires ONNX opset 20.")
-            extractor = RaCoALIKED(num_keypoints=num_keypoints, portable_deform_conv=portable_deform_conv)
+            extractor = RaCoALIKED(
+                num_keypoints=num_keypoints,
+                portable_deform_conv=portable_deform_conv,
+                bypass_ranker=bypass_ranker,
+            )
     matcher = LightGlue(**extractor_type.lightglue_config)
     pipeline = Pipeline(extractor, matcher).eval()
     pipeline.fuse_batch_norm()

@@ -7,7 +7,7 @@ import torch
 
 from lightglue_dynamo.config import Extractor
 from lightglue_dynamo.models import Pipeline
-from lightglue_dynamo.models.aliked import ALIKEDDescriptor, DeformableConv2d, SparseDescriptorHead
+from lightglue_dynamo.models.aliked import ALIKEDDescriptor, DeformableConv2d, RaCoALIKED, SparseDescriptorHead
 from lightglue_dynamo.models.lightglue import LightGlue
 from lightglue_dynamo.models.raco import RaCo, _chunked_topk
 from lightglue_dynamo.preprocessors import RaCoPreprocessor
@@ -102,6 +102,30 @@ def test_raco_truncates_ranked_candidate_pool() -> None:
     assert selected.num_candidates == 32
     for output, candidate in zip(outputs, candidates, strict=True):
         torch.testing.assert_close(output, candidate[:, :16])
+
+
+def test_raco_unranked_matching_path_does_not_execute_ranker() -> None:
+    detector = RaCo(num_keypoints=16, sort_by_ranker=False, weights=None).eval()
+    images = torch.rand(2, 3, 64, 64)
+    with torch.inference_mode():
+        expected = detector(images)[0]
+
+    class _UnexpectedRanker(torch.nn.Module):
+        def forward(self, _image: torch.Tensor) -> torch.Tensor:
+            raise AssertionError("ranker should not execute")
+
+    detector.ranker_head = _UnexpectedRanker()
+    with torch.inference_mode():
+        actual = detector.extract_unranked(images)
+    torch.testing.assert_close(actual, expected)
+
+
+def test_raco_aliked_ranker_bypass_is_explicit_and_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(RaCo, "_load_weights", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ALIKEDDescriptor, "_load_weights", lambda *_args, **_kwargs: None)
+
+    assert not RaCoALIKED(num_keypoints=16).bypass_ranker
+    assert RaCoALIKED(num_keypoints=16, bypass_ranker=True).bypass_ranker
 
 
 def test_raco_caps_candidates_without_reducing_output_count() -> None:

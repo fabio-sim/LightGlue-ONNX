@@ -254,6 +254,7 @@ class RaCoALIKED(nn.Module):
         sort_by_ranker: bool = True,
         topk_chunk_size: int | None = 65536,
         portable_deform_conv: bool = False,
+        bypass_ranker: bool = False,
     ) -> None:
         super().__init__()
         from .raco import RaCo
@@ -269,6 +270,7 @@ class RaCoALIKED(nn.Module):
             topk_chunk_size=topk_chunk_size,
             weights=raco_weights or RaCo.weights_url,
         )
+        self.bypass_ranker = bypass_ranker
         self.aliked = ALIKEDDescriptor(
             weights=aliked_weights or ALIKEDDescriptor.weights_url, portable_deform_conv=portable_deform_conv
         )
@@ -277,6 +279,14 @@ class RaCoALIKED(nn.Module):
         keypoints, detection_scores, ranker_scores = self.raco(image)
         descriptors = self.aliked(image, keypoints)
         return keypoints, detection_scores, descriptors, ranker_scores
+
+    def extract_for_matching(self, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Optionally select detector keypoints directly for an explicitly configured fast path."""
+        if self.bypass_ranker:
+            keypoints = self.raco.extract_unranked(image)
+        else:
+            keypoints, _detection_scores, _ranker_scores = self.raco(image)
+        return keypoints, self.aliked(image, keypoints)
 
     def fuse_batch_norm(self) -> None:
         if self.training:

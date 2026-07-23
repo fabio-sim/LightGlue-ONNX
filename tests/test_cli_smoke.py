@@ -25,6 +25,14 @@ def test_export_only_exposes_dynamo_exporter() -> None:
     assert result.exit_code == 0, result.output
     assert "legacy-export" not in result.output
     assert "fuse-multi-head-attention" not in result.output
+    assert "bypass-ranker" in result.output
+
+
+def test_export_rejects_ranker_bypass_for_other_extractors() -> None:
+    result = CliRunner().invoke(app, ["export", "superpoint", "--bypass-ranker"])
+    assert result.exit_code != 0
+    assert "--bypass-ranker is only supported" in result.output
+    assert "raco_aliked" in result.output
 
 
 def test_export_and_infer_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
