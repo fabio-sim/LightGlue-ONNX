@@ -7,6 +7,7 @@ host memory or repeating completed pairs.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -85,6 +86,46 @@ class PreparedBenchmarkInput:
     def release(self) -> None:
         if isinstance(self.value, CudaPreparedImages):
             self.value.release()
+
+
+@dataclass(frozen=True)
+class TensorRTBuilderOptions:
+    max_workspace_mib: int = 1024
+    optimization_level: int = 3
+    auxiliary_streams: int = 0
+    tactic_sources: str = ""
+    detailed_build_log: bool = False
+
+    def provider_options(self) -> dict[str, Any]:
+        options: dict[str, Any] = {
+            "trt_max_workspace_size": self.max_workspace_mib * 2**20,
+            "trt_builder_optimization_level": self.optimization_level,
+            "trt_auxiliary_streams": self.auxiliary_streams,
+            "trt_detailed_build_log": self.detailed_build_log,
+        }
+        if self.tactic_sources:
+            options["trt_tactic_sources"] = self.tactic_sources
+        return options
+
+    def metadata(self) -> dict[str, Any]:
+        return {
+            "trt_max_workspace_mib": self.max_workspace_mib,
+            "trt_builder_optimization_level": self.optimization_level,
+            "trt_auxiliary_streams": self.auxiliary_streams,
+            "trt_tactic_sources": self.tactic_sources or None,
+            "trt_detailed_build_log": self.detailed_build_log,
+        }
+
+    def cache_tag(self) -> str:
+        tactic_tag = (
+            "all"
+            if not self.tactic_sources
+            else hashlib.sha256(self.tactic_sources.encode()).hexdigest()[:8]
+        )
+        return (
+            f"w{self.max_workspace_mib}-o{self.optimization_level}"
+            f"-a{self.auxiliary_streams}-t{tactic_tag}"
+        )
 
 
 class Executor(Protocol):
@@ -352,6 +393,7 @@ class OrtExecutor:
         precision: Precision,
         cache: Path,
         gpu_mem_limit_mib: int,
+        tensorrt_builder: TensorRTBuilderOptions,
     ) -> None:
         preload_nvidia_libraries(tensorrt=backend == "ort-tensorrt")
         import onnxruntime as ort
@@ -359,16 +401,18 @@ class OrtExecutor:
         cache.mkdir(parents=True, exist_ok=True)
         providers: list[tuple[str, dict[str, Any]]] = []
         if backend == "ort-tensorrt":
+            tensorrt_options = {
+                "trt_engine_cache_enable": True,
+                "trt_engine_cache_path": str(cache / "engines"),
+                "trt_timing_cache_enable": True,
+                "trt_timing_cache_path": str(cache / "timing"),
+                "trt_fp16_enable": precision == "fp16",
+                **tensorrt_builder.provider_options(),
+            }
             providers.append(
                 (
                     "TensorrtExecutionProvider",
-                    {
-                        "trt_engine_cache_enable": True,
-                        "trt_engine_cache_path": str(cache / "engines"),
-                        "trt_timing_cache_enable": True,
-                        "trt_timing_cache_path": str(cache / "timing"),
-                        "trt_fp16_enable": precision == "fp16",
-                    },
+                    tensorrt_options,
                 )
             )
         cuda_options = {
@@ -633,6 +677,7 @@ def _create_executor(
     portable: bool,
     cache: Path,
     ort_gpu_mem_limit_mib: int,
+    tensorrt_builder: TensorRTBuilderOptions,
 ) -> Executor:
     if backend in {"pytorch", "torch-compile"}:
         return TorchExecutor(
@@ -646,7 +691,12 @@ def _create_executor(
         raise typer.BadParameter("--model is required for ONNX Runtime and TensorRT backends")
     if backend in {"ort-cuda", "ort-tensorrt"}:
         return OrtExecutor(
-            model, backend=backend, precision=precision, cache=cache, gpu_mem_limit_mib=ort_gpu_mem_limit_mib
+            model,
+            backend=backend,
+            precision=precision,
+            cache=cache,
+            gpu_mem_limit_mib=ort_gpu_mem_limit_mib,
+            tensorrt_builder=tensorrt_builder,
         )
     return TensorRTExecutor(model, precision=precision, engine_path=cache / "model.engine", size=size)
 
@@ -669,6 +719,21 @@ def run(
     portable_deform_conv: Annotated[bool, typer.Option("--portable-deform-conv/--torchvision-deform-conv")] = False,
     cache_root: Annotated[Path, typer.Option(file_okay=False)] = Path("data/benchmark_cache"),
     ort_gpu_mem_limit_mib: Annotated[int, typer.Option(min=1)] = 9216,
+    trt_max_workspace_mib: Annotated[int, typer.Option(min=1)] = 1024,
+    trt_builder_optimization_level: Annotated[int, typer.Option(min=0, max=5)] = 3,
+    trt_auxiliary_streams: Annotated[int, typer.Option(min=-1)] = 0,
+    trt_tactic_sources: Annotated[
+        str,
+        typer.Option(
+            help=(
+                "TensorRT tactic-source expression, for example "
+                "'-CUDNN,+CUBLAS,+CUBLAS_LT,+EDGE_MASK_CONVOLUTIONS'. Empty uses TensorRT defaults."
+            )
+        ),
+    ] = "",
+    trt_detailed_build_log: Annotated[
+        bool, typer.Option("--trt-detailed-build-log/--no-trt-detailed-build-log")
+    ] = False,
     preprocessing: Annotated[
         PreprocessingBackend,
         typer.Option(help="Image preprocessing backend. CUDA requires ORT CUDA/TensorRT and JPEG inputs."),
@@ -693,6 +758,13 @@ def run(
     if preprocessing == "cuda" and backend not in {"ort-cuda", "ort-tensorrt"}:
         raise typer.BadParameter("CUDA preprocessing currently supports the ORT CUDA and ORT TensorRT backends")
 
+    tensorrt_builder = TensorRTBuilderOptions(
+        max_workspace_mib=trt_max_workspace_mib,
+        optimization_level=trt_builder_optimization_level,
+        auxiliary_streams=trt_auxiliary_streams,
+        tactic_sources=trt_tactic_sources,
+        detailed_build_log=trt_detailed_build_log,
+    )
     configuration = {
         "backend": backend,
         "model": str(model.resolve()) if model is not None else None,
@@ -708,13 +780,17 @@ def run(
         else None,
         "preprocessing": preprocessing,
         "prefetch": prefetch,
+        **(tensorrt_builder.metadata() if backend == "ort-tensorrt" else {}),
     }
     output.parent.mkdir(parents=True, exist_ok=True)
     records, completed = _completed_records(output, configuration)
     meta_path = output.with_suffix(output.suffix + ".meta.json")
     previous_meta = json.loads(meta_path.read_text()) if records and meta_path.exists() else None
     model_tag = model.stem if model is not None else "pytorch"
-    cache = cache_root / model_tag / f"{backend}-{precision}-s{size}-k{num_keypoints}-{compile_mode}"
+    cache_name = f"{backend}-{precision}-s{size}-k{num_keypoints}-{compile_mode}"
+    if backend == "ort-tensorrt":
+        cache_name += f"-{tensorrt_builder.cache_tag()}"
+    cache = cache_root / model_tag / cache_name
     pairs = list(iter_pairs(dataset_root, scene_info_root))
     expected_pairs = min(len(pairs), max_pairs) if max_pairs else len(pairs)
     if len(pairs) != 1500:
@@ -731,6 +807,7 @@ def run(
         portable=portable_deform_conv,
         cache=cache,
         ort_gpu_mem_limit_mib=ort_gpu_mem_limit_mib,
+        tensorrt_builder=tensorrt_builder,
     )
     cuda_preprocessor: CudaRaCoPreprocessor | None = None
     if preprocessing == "cuda":
