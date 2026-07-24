@@ -128,6 +128,34 @@ def test_raco_aliked_ranker_bypass_is_explicit_and_disabled_by_default(monkeypat
     assert RaCoALIKED(num_keypoints=16, bypass_ranker=True).bypass_ranker
 
 
+def test_raco_reduced_ranker_resolution_maps_keypoints_with_align_corners() -> None:
+    detector = RaCo(num_keypoints=16, ranker_scale=0.75, weights=None).eval()
+    image = torch.rand(2, 3, 64, 96)
+    keypoints = torch.rand(2, 16, 2) * torch.tensor([95.0, 63.0])
+
+    with torch.inference_mode():
+        actual = detector._ranker_scores(image, keypoints)
+        resized = torch.nn.functional.interpolate(image, scale_factor=0.75, mode="bilinear", align_corners=True)
+        expected_keypoints = keypoints * torch.tensor([71.0 / 95.0, 47.0 / 63.0])
+        expected = detector.ranker_head(resized)
+        expected = torch.nn.functional.grid_sample(
+            expected,
+            (2 * expected_keypoints / torch.tensor([71.0, 47.0]) - 1).unsqueeze(2),
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True,
+        )
+        expected = expected.squeeze(-1).transpose(1, 2).squeeze(-1)
+
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("scale", [0, -0.5, 1.01])
+def test_raco_rejects_invalid_ranker_scale(scale: float) -> None:
+    with pytest.raises(ValueError, match="ranker_scale"):
+        RaCo(num_keypoints=16, ranker_scale=scale, weights=None)
+
+
 def test_raco_caps_candidates_without_reducing_output_count() -> None:
     assert RaCo(num_keypoints=2048, weights=None).num_candidates == 3840
     assert RaCo(num_keypoints=4096, weights=None).num_candidates == 4096
@@ -269,9 +297,10 @@ def test_sparse_descriptor_export_preserves_dynamic_batch() -> None:
     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
 
 
-def test_raco_export_preserves_dynamic_spatial_shapes() -> None:
+@pytest.mark.parametrize("ranker_scale", [1.0, 0.75])
+def test_raco_export_preserves_dynamic_spatial_shapes(ranker_scale: float) -> None:
     torch.manual_seed(3)
-    detector = RaCo(num_keypoints=128, weights=None).eval()
+    detector = RaCo(num_keypoints=128, ranker_scale=ranker_scale, weights=None).eval()
     height_factor = torch.export.Dim("height_factor", min=2)
     width_factor = torch.export.Dim("width_factor", min=2)
     exported = torch.export.export(

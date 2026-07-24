@@ -124,6 +124,7 @@ class RaCo(nn.Module):
         subpixel_temperature: float = 0.5,
         sort_by_ranker: bool = True,
         topk_chunk_size: int | None = 65536,
+        ranker_scale: float = 1.0,
         weights: str | Path | None = weights_url,
     ) -> None:
         super().__init__()
@@ -135,6 +136,8 @@ class RaCo(nn.Module):
             raise ValueError("candidate_multiplier must be positive")
         if max_num_candidates is not None and max_num_candidates <= 0:
             raise ValueError("max_num_candidates must be positive or None")
+        if not 0 < ranker_scale <= 1:
+            raise ValueError("ranker_scale must be in the interval (0, 1]")
         self.num_keypoints = num_keypoints
         # Rank a larger detector-selected pool, then retain only the requested
         # number of points. A 2x pool follows RaCo's 2048-candidate regime for
@@ -149,6 +152,9 @@ class RaCo(nn.Module):
         self.subpixel_temperature = subpixel_temperature
         self.sort_by_ranker = sort_by_ranker
         self.topk_chunk_size = topk_chunk_size
+        # Values below one are an explicit speed/rotation-coverage tradeoff;
+        # preserve the checkpoint's native resolution by default.
+        self.ranker_scale = ranker_scale
         self.register_buffer("image_mean", torch.tensor([0.485, 0.456, 0.406])[None, :, None, None], persistent=False)
         self.register_buffer("image_std", torch.tensor([0.229, 0.224, 0.225])[None, :, None, None], persistent=False)
 
@@ -239,12 +245,29 @@ class RaCo(nn.Module):
         _normalized_image, keypoints, _logits = self._candidate_keypoints(image, self.num_keypoints)
         return keypoints + 0.5
 
+    def _ranker_scores(self, image: torch.Tensor, keypoints: torch.Tensor) -> torch.Tensor:
+        ranker_image = image
+        ranker_keypoints = keypoints
+        if self.ranker_scale != 1:
+            ranker_image = F.interpolate(
+                image,
+                scale_factor=self.ranker_scale,
+                mode="bilinear",
+                align_corners=True,
+                recompute_scale_factor=False,
+            )
+            image_shape = shape_as_tensor(image)
+            ranker_shape = shape_as_tensor(ranker_image)
+            image_size = torch.stack((image_shape[-1], image_shape[-2])).to(keypoints) - 1
+            ranker_size = torch.stack((ranker_shape[-1], ranker_shape[-2])).to(keypoints) - 1
+            ranker_keypoints = keypoints * (ranker_size / image_size)
+        return _sample(self.ranker_head(ranker_image), ranker_keypoints)
+
     def forward(self, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         image, keypoints, logits = self._candidate_keypoints(image, self.num_candidates)
-        ranker_map = self.ranker_head(image)
         probabilities = F.softmax(logits.flatten(1), dim=1).reshape_as(logits)
         detection_scores = _sample(probabilities, keypoints)
-        ranker_scores = _sample(ranker_map, keypoints)
+        ranker_scores = self._ranker_scores(image, keypoints)
         keypoints = keypoints + 0.5
 
         if self.sort_by_ranker:
