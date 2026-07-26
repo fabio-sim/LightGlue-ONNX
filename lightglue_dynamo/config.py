@@ -1,18 +1,53 @@
-from enum import StrEnum, auto
+from enum import StrEnum
+from enum import auto as enum_auto
 from typing import Any
 
 
 class InferenceDevice(StrEnum):
-    cpu = auto()
-    cuda = auto()
-    tensorrt = auto()
-    openvino = auto()
+    cpu = enum_auto()
+    cuda = enum_auto()
+    tensorrt = enum_auto()
+    openvino = enum_auto()
+
+
+class RankerMode(StrEnum):
+    """RaCo keypoint-selection policy used by the matching pipeline."""
+
+    auto = enum_auto()
+    dense = enum_auto()
+    candidate_local = "candidate-local"
+    boundary = enum_auto()
+    bypass = enum_auto()
+
+    def resolve(self, num_keypoints: int, height: int | None, width: int | None) -> "RankerMode":
+        """Resolve the measured deployment policy to one export-time branch.
+
+        ONNX/TensorRT must receive a single branch so unselected ranker work is
+        genuinely absent. Dynamic spatial exports therefore use the policy
+        that is best over most measured resolutions, with explicit modes
+        available when a deployment targets a different operating point.
+        """
+        if self is not RankerMode.auto:
+            return self
+        if num_keypoints >= 3072:
+            return RankerMode.bypass
+        if num_keypoints == 512:
+            if height is not None and width is not None and min(height, width) >= 1280:
+                return RankerMode.candidate_local
+            return RankerMode.dense
+        if num_keypoints == 2560:
+            return RankerMode.boundary
+        if 1024 <= num_keypoints < 2560 and (
+            height is None or width is None or min(height, width) >= 768
+        ):
+            return RankerMode.boundary
+        return RankerMode.dense
 
 
 class Extractor(StrEnum):
-    superpoint = auto()
-    disk = auto()
-    raco_aliked = auto()
+    superpoint = enum_auto()
+    disk = enum_auto()
+    raco_aliked = enum_auto()
 
     @property
     def input_dim_divisor(self) -> int:

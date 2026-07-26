@@ -5,11 +5,11 @@ import numpy as np
 import pytest
 import torch
 
-from lightglue_dynamo.config import Extractor
+from lightglue_dynamo.config import Extractor, RankerMode
 from lightglue_dynamo.models import Pipeline
-from lightglue_dynamo.models.aliked import ALIKEDDescriptor, DeformableConv2d, SparseDescriptorHead
+from lightglue_dynamo.models.aliked import ALIKEDDescriptor, DeformableConv2d, RaCoALIKED, SparseDescriptorHead
 from lightglue_dynamo.models.lightglue import LightGlue
-from lightglue_dynamo.models.raco import RaCo, _chunked_topk
+from lightglue_dynamo.models.raco import RaCo, _chunked_topk, _gather_subpixel_offsets, _subpixel_offsets
 from lightglue_dynamo.preprocessors import RaCoPreprocessor
 
 
@@ -104,6 +104,121 @@ def test_raco_truncates_ranked_candidate_pool() -> None:
         torch.testing.assert_close(output, candidate[:, :16])
 
 
+def test_raco_unranked_matching_path_does_not_execute_ranker() -> None:
+    detector = RaCo(num_keypoints=16, sort_by_ranker=False, weights=None).eval()
+    images = torch.rand(2, 3, 64, 64)
+    with torch.inference_mode():
+        expected = detector(images)[0]
+
+    class _UnexpectedRanker(torch.nn.Module):
+        def forward(self, _image: torch.Tensor) -> torch.Tensor:
+            raise AssertionError("ranker should not execute")
+
+    detector.ranker_head = _UnexpectedRanker()
+    with torch.inference_mode():
+        actual = detector.extract_unranked(images)
+    torch.testing.assert_close(actual, expected)
+
+
+def test_raco_aliked_ranker_bypass_is_explicit_and_disabled_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(RaCo, "_load_weights", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ALIKEDDescriptor, "_load_weights", lambda *_args, **_kwargs: None)
+
+    assert not RaCoALIKED(num_keypoints=16).bypass_ranker
+    assert RaCoALIKED(num_keypoints=16, bypass_ranker=True).bypass_ranker
+
+
+def test_raco_ranker_auto_policy_resolves_at_export_time() -> None:
+    assert RankerMode.auto.resolve(512, 1280, 1280) is RankerMode.candidate_local
+    assert RankerMode.auto.resolve(512, 1024, 1024) is RankerMode.dense
+    assert RankerMode.auto.resolve(1024, 512, 512) is RankerMode.dense
+    assert RankerMode.auto.resolve(1024, 768, 768) is RankerMode.boundary
+    assert RankerMode.auto.resolve(2560, 512, 512) is RankerMode.boundary
+    assert RankerMode.auto.resolve(3072, 512, 512) is RankerMode.bypass
+    assert RankerMode.auto.resolve(2048, None, None) is RankerMode.boundary
+
+
+def test_boundary_ranker_only_extracts_candidates_through_window_end(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(RaCo, "_load_weights", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ALIKEDDescriptor, "_load_weights", lambda *_args, **_kwargs: None)
+
+    extractor = RaCoALIKED(num_keypoints=512, ranker_mode=RankerMode.boundary)
+
+    assert extractor.raco.num_candidates == 512 + 256
+
+
+def test_gather_subpixel_offsets_match_unfold_including_borders() -> None:
+    torch.manual_seed(12)
+    logits = torch.randn(2, 1, 7, 9)
+    indices = torch.tensor([[0, 8, 54, 62, 31], [1, 7, 55, 61, 32]])
+
+    expected = _subpixel_offsets(logits, indices, 3, 0.5)
+    actual = _gather_subpixel_offsets(logits, indices, 3, 0.5)
+
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_candidate_local_ranker_preserves_dense_selected_set(fused: bool) -> None:
+    torch.manual_seed(13)
+    detector = RaCo(num_keypoints=16, weights=None).eval()
+    if fused:
+        detector.fuse_batch_norm()
+    images = torch.rand(2, 3, 64, 64)
+
+    with torch.inference_mode():
+        dense_keypoints = detector(images)[0]
+        local_keypoints = detector.extract_candidate_ranked(images)
+
+    for dense, local in zip(dense_keypoints, local_keypoints, strict=True):
+        dense_set = {tuple(point.tolist()) for point in dense}
+        local_set = {tuple(point.tolist()) for point in local}
+        assert local_set == dense_set
+
+
+def test_boundary_ranker_returns_requested_keypoint_count() -> None:
+    detector = RaCo(num_keypoints=16, weights=None).eval()
+    images = torch.rand(2, 3, 64, 64)
+
+    with torch.inference_mode():
+        full_pool = detector.extract_boundary_ranked(images, reranked_count=4, window_count=8)
+        detector.num_candidates = 16 + 8 - 4
+        minimal_pool = detector.extract_boundary_ranked(images, reranked_count=4, window_count=8)
+
+    assert full_pool.shape == (2, 16, 2)
+    torch.testing.assert_close(minimal_pool, full_pool, atol=0, rtol=0)
+
+
+def test_raco_reduced_ranker_resolution_maps_keypoints_with_align_corners() -> None:
+    detector = RaCo(num_keypoints=16, ranker_scale=0.75, weights=None).eval()
+    image = torch.rand(2, 3, 64, 96)
+    keypoints = torch.rand(2, 16, 2) * torch.tensor([95.0, 63.0])
+
+    with torch.inference_mode():
+        actual = detector._ranker_scores(image, keypoints)
+        resized = torch.nn.functional.interpolate(image, scale_factor=0.75, mode="bilinear", align_corners=True)
+        expected_keypoints = keypoints * torch.tensor([71.0 / 95.0, 47.0 / 63.0])
+        expected = detector.ranker_head(resized)
+        expected = torch.nn.functional.grid_sample(
+            expected,
+            (2 * expected_keypoints / torch.tensor([71.0, 47.0]) - 1).unsqueeze(2),
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True,
+        )
+        expected = expected.squeeze(-1).transpose(1, 2).squeeze(-1)
+
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("scale", [0, -0.5, 1.01])
+def test_raco_rejects_invalid_ranker_scale(scale: float) -> None:
+    with pytest.raises(ValueError, match="ranker_scale"):
+        RaCo(num_keypoints=16, ranker_scale=scale, weights=None)
+
+
 def test_raco_caps_candidates_without_reducing_output_count() -> None:
     assert RaCo(num_keypoints=2048, weights=None).num_candidates == 3840
     assert RaCo(num_keypoints=4096, weights=None).num_candidates == 4096
@@ -153,6 +268,15 @@ def test_raco_preprocessor_is_rgb_float32() -> None:
     result = RaCoPreprocessor.preprocess(bgr)
     assert result.dtype == np.float32
     np.testing.assert_allclose(result[0, :, 0, 0], np.asarray([1, 127 / 255, 0], dtype=np.float32))
+
+
+def test_raco_preprocessor_is_contiguous_and_matches_reference() -> None:
+    rng = np.random.default_rng(13)
+    bgr = rng.integers(0, 256, size=(2, 3, 17, 23, 3), dtype=np.uint8)
+    expected = np.ascontiguousarray((bgr[..., ::-1].astype(np.float32) / np.float32(255)).transpose(0, 1, 4, 2, 3))
+    result = RaCoPreprocessor.preprocess(bgr)
+    assert result.flags.c_contiguous
+    np.testing.assert_allclose(result, expected, atol=np.finfo(np.float32).eps, rtol=0)
 
 
 def test_raco_pipeline_uses_universal_output_contract() -> None:
@@ -236,9 +360,10 @@ def test_sparse_descriptor_export_preserves_dynamic_batch() -> None:
     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
 
 
-def test_raco_export_preserves_dynamic_spatial_shapes() -> None:
+@pytest.mark.parametrize("ranker_scale", [1.0, 0.75])
+def test_raco_export_preserves_dynamic_spatial_shapes(ranker_scale: float) -> None:
     torch.manual_seed(3)
-    detector = RaCo(num_keypoints=128, weights=None).eval()
+    detector = RaCo(num_keypoints=128, ranker_scale=ranker_scale, weights=None).eval()
     height_factor = torch.export.Dim("height_factor", min=2)
     width_factor = torch.export.Dim("width_factor", min=2)
     exported = torch.export.export(

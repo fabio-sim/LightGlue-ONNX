@@ -19,8 +19,13 @@ class Pipeline(torch.nn.Module):
         shape = shape_as_tensor(images)
         h = shape[-2]
         w = shape[-1]
-        # Extract keypoints and features
-        keypoints, _scores, descriptors, *_metadata = self.extractor(images)
+        # Extract keypoints and features. Extractors may provide a pipeline-only
+        # path that omits metadata which the matcher never consumes.
+        extract_for_matching = getattr(self.extractor, "extract_for_matching", None)
+        if callable(extract_for_matching):
+            keypoints, descriptors = extract_for_matching(images)
+        else:
+            keypoints, _scores, descriptors, *_metadata = self.extractor(images)
         # Normalize keypoints
         size = torch.stack([w, h]).to(device=keypoints.device, dtype=keypoints.dtype)
         if getattr(self.extractor, "normalize_by_long_edge", False):

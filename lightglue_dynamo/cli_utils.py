@@ -13,7 +13,7 @@ def check_multiple_of(value: int, k: int) -> None:
         raise typer.BadParameter(f"Value must be a multiple of {k}.")
 
 
-def preload_nvidia_libraries(*, tensorrt: bool = False) -> None:
+def preload_nvidia_libraries(*, tensorrt: bool = False, image_codec: bool = False) -> None:
     """Preload NVIDIA wheels whose shared-library directories are not on the loader path."""
     roots = [Path(path) for path in [*site.getsitepackages(), site.getusersitepackages()] if path]
     library_names = [
@@ -35,6 +35,8 @@ def preload_nvidia_libraries(*, tensorrt: bool = False) -> None:
     ]
     if tensorrt:
         library_names.extend([("libnvinfer.so.10",), ("libnvinfer_plugin.so.10",), ("libnvonnxparser.so.10",)])
+    if image_codec:
+        library_names.append(("libnvjpeg.so.13", "libnvjpeg.so.12"))
 
     loaded_directories: set[Path] = set()
     for alternatives in library_names:

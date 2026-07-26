@@ -1,12 +1,12 @@
 from math import ceil, sqrt
 from pathlib import Path
-from typing import Annotated, cast
+from typing import Annotated, Literal, cast
 
 import cv2
 import typer
 
 from lightglue_dynamo.cli_utils import check_multiple_of, preload_nvidia_libraries
-from lightglue_dynamo.config import Extractor, InferenceDevice
+from lightglue_dynamo.config import Extractor, InferenceDevice, RankerMode
 
 app = typer.Typer()
 
@@ -46,6 +46,22 @@ def export(
             help="Decompose ALIKED DeformConv for TensorRT and WebGPU portability.",
         ),
     ] = True,
+    ranker_mode: Annotated[
+        RankerMode,
+        typer.Option(
+            help=(
+                "RaCo matching policy. 'auto' selects a measured export-time specialization; "
+                "standalone RaCo outputs remain densely ranked."
+            )
+        ),
+    ] = RankerMode.auto,
+    bypass_ranker: Annotated[
+        bool,
+        typer.Option(
+            "--bypass-ranker",
+            help="Compatibility shortcut for '--ranker-mode bypass'.",
+        ),
+    ] = False,
     fp16: Annotated[bool, typer.Option("--fp16", help="Whether to also convert to FP16.")] = False,
 ) -> None:
     """Export LightGlue to ONNX."""
@@ -56,15 +72,33 @@ def export(
 
     from lightglue_dynamo.models import DISK, LightGlue, Pipeline, RaCoALIKED, SuperPoint
 
+    if (bypass_ranker or ranker_mode is not RankerMode.auto) and extractor_type != Extractor.raco_aliked:
+        raise typer.BadParameter("RaCo ranker options are only supported for the raco_aliked extractor")
+    if bypass_ranker and ranker_mode is not RankerMode.auto:
+        raise typer.BadParameter("--bypass-ranker cannot be combined with --ranker-mode")
+    resolved_ranker_mode = (
+        RankerMode.bypass
+        if bypass_ranker
+        else ranker_mode.resolve(num_keypoints, height or None, width or None)
+    )
+
     match extractor_type:
         case Extractor.superpoint:
             extractor = SuperPoint(num_keypoints=num_keypoints)
+            num_candidates = num_keypoints
         case Extractor.disk:
             extractor = DISK(num_keypoints=num_keypoints)
+            num_candidates = num_keypoints
         case Extractor.raco_aliked:
             if opset < 20:
                 raise typer.BadParameter("raco_aliked export requires ONNX opset 20.")
-            extractor = RaCoALIKED(num_keypoints=num_keypoints, portable_deform_conv=portable_deform_conv)
+            extractor = RaCoALIKED(
+                num_keypoints=num_keypoints,
+                portable_deform_conv=portable_deform_conv,
+                ranker_mode=resolved_ranker_mode,
+            )
+            num_candidates = extractor.raco.num_candidates
+            typer.echo(f"RaCo matching policy: {resolved_ranker_mode}")
     matcher = LightGlue(**extractor_type.lightglue_config)
     pipeline = Pipeline(extractor, matcher).eval()
     pipeline.fuse_batch_norm()
@@ -77,8 +111,13 @@ def export(
     check_multiple_of(batch_size, 2)
     check_multiple_of(height, extractor_type.input_dim_divisor)
     check_multiple_of(width, extractor_type.input_dim_divisor)
+    if (
+        extractor_type is Extractor.raco_aliked
+        and resolved_ranker_mode in {RankerMode.candidate_local, RankerMode.boundary}
+        and ((height and height < 64) or (width and width < 64))
+    ):
+        raise typer.BadParameter("Candidate-local RaCo ranking requires height and width of at least 64")
 
-    num_candidates = extractor_type.keypoint_candidate_count(num_keypoints)
     if height > 0 and width > 0 and num_candidates > height * width:
         raise typer.BadParameter(
             f"The extractor requires {num_candidates} candidate locations, more than the {height * width} pixels."
@@ -184,6 +223,10 @@ def infer(
     ] = InferenceDevice.cuda,
     fp16: Annotated[bool, typer.Option("--fp16", help="Whether model uses FP16 precision.")] = False,
     profile: Annotated[bool, typer.Option("--profile", help="Whether to profile model execution.")] = False,
+    preprocessing: Annotated[
+        Literal["opencv", "cuda"],
+        typer.Option(help="Image preprocessing backend. CUDA currently supports RaCo JPEG inputs on NVIDIA GPUs."),
+    ] = "opencv",
 ) -> None:
     """Run inference for LightGlue ONNX model."""
     import time
@@ -197,24 +240,39 @@ def infer(
     import onnxruntime as ort
 
     from lightglue_dynamo import viz
-    from lightglue_dynamo.preprocessors import DISKPreprocessor, RaCoPreprocessor, SuperPointPreprocessor
+    from lightglue_dynamo.preprocessors import (
+        CudaPreparedImages,
+        CudaRaCoPreprocessor,
+        DISKPreprocessor,
+        RaCoPreprocessor,
+        SuperPointPreprocessor,
+        prepare_host_images,
+    )
 
-    def _load_and_resize(path: Path) -> np.ndarray:
-        image = cv2.imread(str(path))
-        if image is None:
-            raise typer.BadParameter(f"Failed to read image: {path}")
-        return cv2.resize(cast(np.ndarray, image), (width, height))
+    if preprocessing == "cuda" and (
+        extractor_type != Extractor.raco_aliked or device not in {InferenceDevice.cuda, InferenceDevice.tensorrt}
+    ):
+        raise typer.BadParameter("CUDA preprocessing requires the RaCo-ALIKED extractor and CUDA or TensorRT device")
 
-    raw_images = [_load_and_resize(left_image_path), _load_and_resize(right_image_path)]
-    images = np.stack(raw_images)
-    match extractor_type:
-        case Extractor.superpoint:
-            images = SuperPointPreprocessor.preprocess(images)
-        case Extractor.disk:
-            images = DISKPreprocessor.preprocess(images)
-        case Extractor.raco_aliked:
-            images = RaCoPreprocessor.preprocess(images)
-    images = images.astype(np.float16 if fp16 and device != InferenceDevice.tensorrt else np.float32)
+    host_prepared = None
+    images: np.ndarray | CudaPreparedImages
+    if preprocessing == "opencv":
+        preprocessor = {
+            Extractor.superpoint: SuperPointPreprocessor,
+            Extractor.disk: DISKPreprocessor,
+            Extractor.raco_aliked: RaCoPreprocessor,
+        }[extractor_type]
+        try:
+            host_prepared = prepare_host_images(
+                (left_image_path, right_image_path),
+                width,
+                height,
+                preprocessor,
+                dtype=np.float16 if fp16 and device != InferenceDevice.tensorrt else np.float32,
+            )
+        except FileNotFoundError as exc:
+            raise typer.BadParameter(str(exc)) from exc
+        images = host_prepared.images
 
     if device in {InferenceDevice.cuda, InferenceDevice.tensorrt}:
         preload = getattr(ort, "preload_dlls", None)
@@ -268,41 +326,86 @@ def infer(
         else:
             raise
 
-    input_shape = session.get_inputs()[0].shape
-    if len(input_shape) == 4:
-        channel_dim = input_shape[1]
-        height_dim = input_shape[2]
-        width_dim = input_shape[3]
-        if isinstance(channel_dim, int) and channel_dim != images.shape[1]:
-            raise typer.BadParameter(
-                f"Model expects {channel_dim} channels but got {images.shape[1]} from preprocessing."
-            )
-        if isinstance(height_dim, int) and height_dim != height:
-            raise typer.BadParameter(f"Model expects height={height_dim} but got {height}.")
-        if isinstance(width_dim, int) and width_dim != width:
-            raise typer.BadParameter(f"Model expects width={width_dim} but got {width}.")
+    cuda_preprocessor: CudaRaCoPreprocessor | None = None
+    cuda_prepared: CudaPreparedImages | None = None
+    preprocessing_ms = host_prepared.total_ms if host_prepared is not None else None
+    try:
+        if preprocessing == "cuda":
+            active_providers = set(session.get_providers())
+            if not active_providers.intersection({"CUDAExecutionProvider", "TensorrtExecutionProvider"}):
+                raise typer.BadParameter("CUDA preprocessing cannot be used after falling back to CPU execution")
+            input_dtype = "float16" if session.get_inputs()[0].type == "tensor(float16)" else "float32"
+            cuda_preprocessor = CudaRaCoPreprocessor(width, height, dtype=input_dtype)
+            cuda_prepared = cuda_preprocessor.prepare((left_image_path, right_image_path))
+            preprocessing_ms = cuda_prepared.synchronize()
+            images = cuda_prepared
 
-    last_inference_time: float | None = None
-    for _ in range(100 if profile else 1):
-        if profile:
-            start = time.perf_counter()
-        outputs = cast(list[np.ndarray], session.run(None, {"images": images}))
-        if profile:
-            last_inference_time = time.perf_counter() - start
-        keypoints, matches, _mscores = outputs
+        input_shape = session.get_inputs()[0].shape
+        prepared_shape = images.shape
+        if len(input_shape) == 4:
+            channel_dim = input_shape[1]
+            height_dim = input_shape[2]
+            width_dim = input_shape[3]
+            if isinstance(channel_dim, int) and channel_dim != prepared_shape[1]:
+                raise typer.BadParameter(
+                    f"Model expects {channel_dim} channels but got {prepared_shape[1]} from preprocessing."
+                )
+            if isinstance(height_dim, int) and height_dim != height:
+                raise typer.BadParameter(f"Model expects height={height_dim} but got {height}.")
+            if isinstance(width_dim, int) and width_dim != width:
+                raise typer.BadParameter(f"Model expects width={width_dim} but got {width}.")
 
-    match_count = int(matches.shape[0])
-    typer.echo(f"Matches: {match_count}")
-    if profile and last_inference_time is not None:
-        typer.echo(f"Inference Time: {last_inference_time:.6f} s")
+        last_inference_time: float | None = None
+        if isinstance(images, CudaPreparedImages):
+            binding = session.io_binding()
+            binding.bind_ortvalue_input("images", images.to_ort_value(ort))
+            for output in session.get_outputs():
+                binding.bind_output(output.name, "cuda", 0)
+            for _ in range(100 if profile else 1):
+                if profile:
+                    start = time.perf_counter()
+                session.run_with_iobinding(binding)
+                binding.synchronize_outputs()
+                outputs = cast(list[np.ndarray], binding.copy_outputs_to_cpu())
+                if profile:
+                    last_inference_time = time.perf_counter() - start
+                keypoints, matches, _mscores = outputs
+        else:
+            for _ in range(100 if profile else 1):
+                if profile:
+                    start = time.perf_counter()
+                outputs = cast(list[np.ndarray], session.run(None, {"images": images}))
+                if profile:
+                    last_inference_time = time.perf_counter() - start
+                keypoints, matches, _mscores = outputs
 
-    if output_path is not None or show:
-        viz.plot_images(raw_images)
-        viz.plot_matches(keypoints[0][matches[..., 1]], keypoints[1][matches[..., 2]], color="lime", lw=0.2)
-        if output_path is not None:
-            viz.save_plot(output_path)
-        if show:
-            viz.plt.show()
+        match_count = int(matches.shape[0])
+        typer.echo(f"Matches: {match_count}")
+        if profile and last_inference_time is not None:
+            typer.echo(f"Preprocessing Time: {preprocessing_ms / 1000:.6f} s")
+            typer.echo(f"Inference Time: {last_inference_time:.6f} s")
+
+        if output_path is not None or show:
+            if host_prepared is not None:
+                raw_images = host_prepared.resized_bgr
+            elif cuda_prepared is not None:
+                raw_images = [
+                    cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA)
+                    for image in cuda_prepared.original_bgr_images()
+                ]
+            else:
+                raise RuntimeError("Missing visualization images")
+            viz.plot_images(raw_images)
+            viz.plot_matches(keypoints[0][matches[..., 1]], keypoints[1][matches[..., 2]], color="lime", lw=0.2)
+            if output_path is not None:
+                viz.save_plot(output_path)
+            if show:
+                viz.plt.show()
+    finally:
+        if cuda_prepared is not None:
+            cuda_prepared.release()
+        if cuda_preprocessor is not None:
+            cuda_preprocessor.close()
 
 
 @app.command()
@@ -359,24 +462,26 @@ def trtexec(
     )
 
     from lightglue_dynamo import viz
-    from lightglue_dynamo.preprocessors import DISKPreprocessor, RaCoPreprocessor, SuperPointPreprocessor
+    from lightglue_dynamo.preprocessors import (
+        DISKPreprocessor,
+        RaCoPreprocessor,
+        SuperPointPreprocessor,
+        prepare_host_images,
+    )
 
-    def _load_and_resize(path: Path) -> np.ndarray:
-        image = cv2.imread(str(path))
-        if image is None:
-            raise typer.BadParameter(f"Failed to read image: {path}")
-        return cv2.resize(cast(np.ndarray, image), (width, height))
-
-    raw_images = [_load_and_resize(left_image_path), _load_and_resize(right_image_path)]
-    images = np.stack(raw_images)
-    match extractor_type:
-        case Extractor.superpoint:
-            images = SuperPointPreprocessor.preprocess(images)
-        case Extractor.disk:
-            images = DISKPreprocessor.preprocess(images)
-        case Extractor.raco_aliked:
-            images = RaCoPreprocessor.preprocess(images)
-    images = images.astype(np.float32)
+    preprocessor = {
+        Extractor.superpoint: SuperPointPreprocessor,
+        Extractor.disk: DISKPreprocessor,
+        Extractor.raco_aliked: RaCoPreprocessor,
+    }[extractor_type]
+    try:
+        prepared = prepare_host_images(
+            (left_image_path, right_image_path), width, height, preprocessor, dtype=np.float32
+        )
+    except FileNotFoundError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    raw_images = prepared.resized_bgr
+    images = prepared.images
 
     if strongly_typed and precision_constraints.lower() != "none":
         raise typer.BadParameter("precision-constraints must be 'none' when --strongly-typed is set.")

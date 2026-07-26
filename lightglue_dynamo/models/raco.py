@@ -74,6 +74,34 @@ def _subpixel_offsets(logits: torch.Tensor, indices: torch.Tensor, nms_radius: i
     return torch.einsum("bkn,kd->bnd", probabilities, offsets)
 
 
+def _gather_subpixel_offsets(
+    logits: torch.Tensor, indices: torch.Tensor, nms_radius: int, temperature: float
+) -> torch.Tensor:
+    """Gather the same zero-padded neighborhoods as ``unfold`` without ONNX Pad."""
+    batch = logits.shape[0]
+    shape = shape_as_tensor(logits)
+    height = shape[-2]
+    width = shape[-1]
+    center_x = torch.remainder(indices, width)
+    center_y = torch.div(indices, width, rounding_mode="floor")
+    coordinates = torch.arange(nms_radius, device=logits.device) - nms_radius // 2
+    offset_y, offset_x = torch.meshgrid(coordinates, coordinates, indexing="ij")
+    offset_x = offset_x.flatten()
+    offset_y = offset_y.flatten()
+    sample_x = center_x[..., None] + offset_x
+    sample_y = center_y[..., None] + offset_y
+    valid = (sample_x >= 0) & (sample_x < width) & (sample_y >= 0) & (sample_y < height)
+    sample_x = torch.minimum(torch.maximum(sample_x, torch.zeros_like(sample_x)), width - 1)
+    sample_y = torch.minimum(torch.maximum(sample_y, torch.zeros_like(sample_y)), height - 1)
+    linear = (sample_y * width + sample_x).flatten(1)
+    patches = logits.flatten(1).gather(1, linear)
+    patches = patches.reshape(batch, indices.shape[1], nms_radius**2)
+    patches = torch.where(valid, patches, 0).transpose(1, 2)
+    probabilities = F.softmax(patches / temperature, dim=1)
+    offsets = torch.stack((offset_x, offset_y), dim=-1).to(logits)
+    return torch.einsum("bkn,kd->bnd", probabilities, offsets)
+
+
 def _sample(feature_map: torch.Tensor, keypoints: torch.Tensor) -> torch.Tensor:
     shape = shape_as_tensor(feature_map)
     scale = torch.stack((shape[-1], shape[-2])).to(keypoints) - 1
@@ -113,6 +141,11 @@ def _chunked_topk(
 
 class RaCo(nn.Module):
     weights_url = "https://github.com/cvg/RaCo/releases/download/v1.0.0/raco.pth"
+    ranker_receptive_radius = 20
+    ranker_patch_size = 42
+    ranker_boundary_strip_size = 41
+    boundary_reranked_count = 256
+    boundary_window_count = 512
 
     def __init__(
         self,
@@ -124,6 +157,7 @@ class RaCo(nn.Module):
         subpixel_temperature: float = 0.5,
         sort_by_ranker: bool = True,
         topk_chunk_size: int | None = 65536,
+        ranker_scale: float = 1.0,
         weights: str | Path | None = weights_url,
     ) -> None:
         super().__init__()
@@ -135,6 +169,8 @@ class RaCo(nn.Module):
             raise ValueError("candidate_multiplier must be positive")
         if max_num_candidates is not None and max_num_candidates <= 0:
             raise ValueError("max_num_candidates must be positive or None")
+        if not 0 < ranker_scale <= 1:
+            raise ValueError("ranker_scale must be in the interval (0, 1]")
         self.num_keypoints = num_keypoints
         # Rank a larger detector-selected pool, then retain only the requested
         # number of points. A 2x pool follows RaCo's 2048-candidate regime for
@@ -149,6 +185,9 @@ class RaCo(nn.Module):
         self.subpixel_temperature = subpixel_temperature
         self.sort_by_ranker = sort_by_ranker
         self.topk_chunk_size = topk_chunk_size
+        # Values below one are an explicit speed/rotation-coverage tradeoff;
+        # preserve the checkpoint's native resolution by default.
+        self.ranker_scale = ranker_scale
         self.register_buffer("image_mean", torch.tensor([0.485, 0.456, 0.406])[None, :, None, None], persistent=False)
         self.register_buffer("image_std", torch.tensor([0.229, 0.224, 0.225])[None, :, None, None], persistent=False)
 
@@ -199,7 +238,9 @@ class RaCo(nn.Module):
             if isinstance(module, (ConvBlock, ResBlock)):
                 module.fuse_batch_norm()
 
-    def forward(self, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _candidate_keypoints(
+        self, image: torch.Tensor, count: int, *, gather_subpixel: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         image = (image - self.image_mean) / self.image_std
 
         x1 = self.block1(image)
@@ -216,7 +257,6 @@ class RaCo(nn.Module):
             dim=1,
         )
         logits = self.score_head(features)
-        ranker_map = self.ranker_head(image)
         # Spatial softmax is strictly monotonic, so local maxima and their
         # ordering can be selected directly from logits. Keep probability
         # computation after selection: standalone RaCo still returns detection
@@ -224,18 +264,164 @@ class RaCo(nn.Module):
         # otherwise unused full-resolution branch.
         nms = F.max_pool2d(logits, self.nms_radius, stride=1, padding=self.nms_radius // 2)
         logits_nms = torch.where(logits == nms, logits, -torch.inf)
-        _top_values, top_indices = _chunked_topk(
-            logits_nms.flatten(1), self.num_candidates, self.topk_chunk_size
-        )
+        _top_values, top_indices = _chunked_topk(logits_nms.flatten(1), count, self.topk_chunk_size)
         width = shape_as_tensor(logits)[-1]
         x = torch.remainder(top_indices, width)
         y = torch.div(top_indices, width, rounding_mode="floor")
         keypoints = torch.stack((x, y), dim=-1).to(logits.dtype)
         if self.subpixel_sampling:
-            keypoints = keypoints + _subpixel_offsets(logits, top_indices, self.nms_radius, self.subpixel_temperature)
+            subpixel = _gather_subpixel_offsets if gather_subpixel else _subpixel_offsets
+            keypoints = keypoints + subpixel(logits, top_indices, self.nms_radius, self.subpixel_temperature)
+        return image, keypoints, logits
+
+    def extract_unranked(self, image: torch.Tensor) -> torch.Tensor:
+        """Select detector keypoints directly for an experimental matching fast path."""
+        _normalized_image, keypoints, _logits = self._candidate_keypoints(image, self.num_keypoints)
+        return keypoints + 0.5
+
+    def _ranker_scores(self, image: torch.Tensor, keypoints: torch.Tensor) -> torch.Tensor:
+        ranker_image = image
+        ranker_keypoints = keypoints
+        if self.ranker_scale != 1:
+            ranker_image = F.interpolate(
+                image,
+                scale_factor=self.ranker_scale,
+                mode="bilinear",
+                align_corners=True,
+                recompute_scale_factor=False,
+            )
+            image_shape = shape_as_tensor(image)
+            ranker_shape = shape_as_tensor(ranker_image)
+            image_size = torch.stack((image_shape[-1], image_shape[-2])).to(keypoints) - 1
+            ranker_size = torch.stack((ranker_shape[-1], ranker_shape[-2])).to(keypoints) - 1
+            ranker_keypoints = keypoints * (ranker_size / image_size)
+        return _sample(self.ranker_head(ranker_image), ranker_keypoints)
+
+    def _candidate_patches(self, image: torch.Tensor, keypoints: torch.Tensor) -> torch.Tensor:
+        """Gather exact ranker receptive fields around candidate keypoints."""
+        batch, channels, height, width = image.shape
+        lower = keypoints.floor().long()
+        radius = self.ranker_receptive_radius
+        patch_size = self.ranker_patch_size
+        x_corner = (lower[..., 0] - radius).clamp(0, width - patch_size)
+        y_corner = (lower[..., 1] - radius).clamp(0, height - patch_size)
+        offset = torch.arange(patch_size, device=image.device)
+        y_offset, x_offset = torch.meshgrid(offset, offset, indexing="ij")
+        x = x_corner[..., None, None] + x_offset
+        y = y_corner[..., None, None] + y_offset
+        linear_indices = (y * width + x).flatten(1)
+        linear_indices = linear_indices[:, None].expand(-1, channels, -1)
+        sampled = image.flatten(2).gather(2, linear_indices)
+        patches = sampled.reshape(batch, channels, keypoints.shape[1], patch_size, patch_size)
+        return patches.permute(0, 2, 1, 3, 4).flatten(0, 1)
+
+    def _valid_ranker(self, patches: torch.Tensor) -> torch.Tensor:
+        """Evaluate the ranker without padding on already haloed patches."""
+        tensor = patches
+        for block in self.ranker_head[:-1]:
+            if not isinstance(block, ResBlock):
+                raise RuntimeError("Candidate-local ranking requires the standard RaCo ranker")
+            convolved = block.gate(block.bn1(F.conv2d(tensor, block.conv1.weight, block.conv1.bias)))
+            convolved = block.bn2(F.conv2d(convolved, block.conv2.weight, block.conv2.bias))
+            identity = block.match_dims(tensor[..., 2:-2, 2:-2])
+            tensor = block.gate(convolved + identity)
+        final = self.ranker_head[-1]
+        if not isinstance(final, nn.Conv2d):
+            raise RuntimeError("Candidate-local ranking requires the standard RaCo ranker")
+        return F.conv2d(tensor, final.weight, final.bias)
+
+    def _candidate_local_ranker_scores(self, image: torch.Tensor, keypoints: torch.Tensor) -> torch.Tensor:
+        """Evaluate exact full-resolution scores only at candidate locations."""
+        if self.ranker_scale != 1:
+            raise RuntimeError("Candidate-local ranking requires ranker_scale=1")
+        batch = image.shape[0]
+        shape = shape_as_tensor(image)
+        height = shape[-2].to(keypoints)
+        width = shape[-1].to(keypoints)
+        lower = keypoints.floor()
+
+        local_map = self._valid_ranker(self._candidate_patches(image, keypoints))
+        local_map = local_map[:, 0].reshape(batch, keypoints.shape[1], 2, 2)
+        fraction = keypoints - lower
+        x_fraction = fraction[..., 0]
+        y_fraction = fraction[..., 1]
+        scores = (
+            local_map[..., 0, 0] * (1 - x_fraction) * (1 - y_fraction)
+            + local_map[..., 0, 1] * x_fraction * (1 - y_fraction)
+            + local_map[..., 1, 0] * (1 - x_fraction) * y_fraction
+            + local_map[..., 1, 1] * x_fraction * y_fraction
+        )
+
+        strip_size = self.ranker_boundary_strip_size
+        horizontal = torch.cat((image[..., :strip_size, :], image[..., -strip_size:, :]), dim=0)
+        horizontal_map = self.ranker_head(horizontal)
+        horizontal_keypoints = torch.cat(
+            (keypoints, keypoints - torch.stack((torch.zeros_like(height), height - strip_size))), dim=0
+        )
+        horizontal_scores = _sample(horizontal_map, horizontal_keypoints)
+        top_scores = horizontal_scores[:batch]
+        bottom_scores = horizontal_scores[batch:]
+
+        vertical = torch.cat((image[..., :strip_size], image[..., -strip_size:]), dim=0)
+        vertical_map = self.ranker_head(vertical)
+        vertical_keypoints = torch.cat(
+            (keypoints, keypoints - torch.stack((width - strip_size, torch.zeros_like(width)))), dim=0
+        )
+        vertical_scores = _sample(vertical_map, vertical_keypoints)
+        left_scores = vertical_scores[:batch]
+        right_scores = vertical_scores[batch:]
+
+        radius = self.ranker_receptive_radius
+        scores = torch.where(lower[..., 1] < radius, top_scores, scores)
+        scores = torch.where(lower[..., 1] > height - radius - 2, bottom_scores, scores)
+        scores = torch.where(lower[..., 0] < radius, left_scores, scores)
+        return torch.where(lower[..., 0] > width - radius - 2, right_scores, scores)
+
+    def extract_candidate_ranked(self, image: torch.Tensor) -> torch.Tensor:
+        """Select the regular ranked set using sparse candidate-local evaluation."""
+        image, keypoints, _logits = self._candidate_keypoints(
+            image, self.num_candidates, gather_subpixel=True
+        )
+        ranker_scores = self._candidate_local_ranker_scores(image, keypoints)
+        order = ranker_scores.topk(self.num_keypoints, dim=1).indices
+        return keypoints.gather(1, order[..., None].expand(-1, -1, 2)) + 0.5
+
+    def extract_boundary_ranked(
+        self,
+        image: torch.Tensor,
+        *,
+        reranked_count: int | None = None,
+        window_count: int | None = None,
+    ) -> torch.Tensor:
+        """Rerank a fixed detector-order window around the output boundary."""
+        if reranked_count is None:
+            reranked_count = self.boundary_reranked_count
+        if window_count is None:
+            window_count = self.boundary_window_count
+        if not 0 < reranked_count <= self.num_keypoints:
+            raise ValueError("reranked_count must be in (0, num_keypoints]")
+        if window_count < reranked_count:
+            raise ValueError("window_count must be at least reranked_count")
+        window_start = self.num_keypoints - reranked_count
+        if window_start + window_count > self.num_candidates:
+            raise ValueError("The reranking window exceeds the detector candidate pool")
+
+        image, keypoints, _logits = self._candidate_keypoints(
+            image, self.num_candidates, gather_subpixel=True
+        )
+        window_keypoints = keypoints[:, window_start : window_start + window_count]
+        window_scores = self._candidate_local_ranker_scores(image, window_keypoints)
+        window_order = window_scores.topk(reranked_count, dim=1).indices
+        prefix = torch.arange(window_start, device=window_order.device, dtype=window_order.dtype)
+        prefix = prefix[None].expand(window_order.shape[0], -1)
+        selected = torch.cat((prefix, window_order + window_start), dim=1)
+        return keypoints.gather(1, selected[..., None].expand(-1, -1, 2)) + 0.5
+
+    def forward(self, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        image, keypoints, logits = self._candidate_keypoints(image, self.num_candidates)
         probabilities = F.softmax(logits.flatten(1), dim=1).reshape_as(logits)
         detection_scores = _sample(probabilities, keypoints)
-        ranker_scores = _sample(ranker_map, keypoints)
+        ranker_scores = self._ranker_scores(image, keypoints)
         keypoints = keypoints + 0.5
 
         if self.sort_by_ranker:
