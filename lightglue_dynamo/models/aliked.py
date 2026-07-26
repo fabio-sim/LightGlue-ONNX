@@ -7,6 +7,7 @@ import torchvision
 from torch import nn
 from torch.nn.utils.fusion import fuse_conv_bn_eval
 
+from ..config import RankerMode
 from ..ops.shape_utils import shape_as_tensor
 
 
@@ -255,11 +256,20 @@ class RaCoALIKED(nn.Module):
         topk_chunk_size: int | None = 65536,
         ranker_scale: float = 1.0,
         portable_deform_conv: bool = False,
-        bypass_ranker: bool = False,
+        ranker_mode: RankerMode = RankerMode.dense,
+        bypass_ranker: bool | None = None,
     ) -> None:
         super().__init__()
         from .raco import RaCo
 
+        if bypass_ranker is not None:
+            if ranker_mode is not RankerMode.dense:
+                raise ValueError("bypass_ranker cannot be combined with ranker_mode")
+            ranker_mode = RankerMode.bypass if bypass_ranker else RankerMode.dense
+        if ranker_mode is RankerMode.auto:
+            ranker_mode = ranker_mode.resolve(num_keypoints, None, None)
+        if ranker_mode in {RankerMode.candidate_local, RankerMode.boundary} and ranker_scale != 1:
+            raise ValueError(f"{ranker_mode} ranking requires ranker_scale=1")
         self.raco = RaCo(
             num_keypoints=num_keypoints,
             candidate_multiplier=candidate_multiplier,
@@ -272,10 +282,27 @@ class RaCoALIKED(nn.Module):
             ranker_scale=ranker_scale,
             weights=raco_weights or RaCo.weights_url,
         )
-        self.bypass_ranker = bypass_ranker
+        if ranker_mode is RankerMode.boundary:
+            required_candidates = (
+                num_keypoints + RaCo.boundary_window_count - RaCo.boundary_reranked_count
+            )
+            if self.raco.num_candidates < required_candidates:
+                raise ValueError(
+                    f"Boundary ranking requires at least {required_candidates} detector candidates"
+                )
+            # The boundary window ends at K + (window_count - reranked_count).
+            # Candidates beyond it cannot affect the selected K-point set, so
+            # avoid extracting the unused remainder of the legacy 2K pool.
+            self.raco.num_candidates = required_candidates
+        self.ranker_mode = ranker_mode
         self.aliked = ALIKEDDescriptor(
             weights=aliked_weights or ALIKEDDescriptor.weights_url, portable_deform_conv=portable_deform_conv
         )
+
+    @property
+    def bypass_ranker(self) -> bool:
+        """Compatibility view of the explicit bypass selection mode."""
+        return self.ranker_mode is RankerMode.bypass
 
     def forward(self, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         keypoints, detection_scores, ranker_scores = self.raco(image)
@@ -283,11 +310,18 @@ class RaCoALIKED(nn.Module):
         return keypoints, detection_scores, descriptors, ranker_scores
 
     def extract_for_matching(self, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Optionally select detector keypoints directly for an explicitly configured fast path."""
-        if self.bypass_ranker:
-            keypoints = self.raco.extract_unranked(image)
-        else:
-            keypoints, _detection_scores, _ranker_scores = self.raco(image)
+        """Select keypoints through the configured pipeline-specific ranker policy."""
+        match self.ranker_mode:
+            case RankerMode.bypass:
+                keypoints = self.raco.extract_unranked(image)
+            case RankerMode.candidate_local:
+                keypoints = self.raco.extract_candidate_ranked(image)
+            case RankerMode.boundary:
+                keypoints = self.raco.extract_boundary_ranked(image)
+            case RankerMode.dense:
+                keypoints, _detection_scores, _ranker_scores = self.raco(image)
+            case RankerMode.auto:
+                raise RuntimeError("ranker_mode must be resolved before inference")
         return keypoints, self.aliked(image, keypoints)
 
     def fuse_batch_norm(self) -> None:

@@ -27,6 +27,7 @@ import numpy as np
 import typer
 
 from lightglue_dynamo.cli_utils import preload_nvidia_libraries
+from lightglue_dynamo.config import RankerMode
 from lightglue_dynamo.preprocessors import (
     CudaPreparedImages,
     CudaRaCoPreprocessor,
@@ -139,6 +140,32 @@ class Executor(Protocol):
     def peak_memory_mib(self) -> float | None: ...
 
     def close(self) -> None: ...
+
+
+class OrtModule(Protocol):
+    @staticmethod
+    def get_available_providers() -> list[str]: ...
+
+
+def _require_ort_gpu_providers(ort: OrtModule, backend: Backend) -> None:
+    if backend not in {"ort-cuda", "ort-tensorrt"}:
+        return
+    available = set(ort.get_available_providers())
+    required = {"CUDAExecutionProvider"}
+    if backend == "ort-tensorrt":
+        required.add("TensorrtExecutionProvider")
+    missing = required - available
+    if not missing:
+        return
+    providers = ", ".join(sorted(available)) or "none"
+    requested = ", ".join(sorted(missing))
+    raise RuntimeError(
+        f"{backend} requires {requested}, but ONNX Runtime exposes only: {providers}. "
+        "The CPU and GPU ONNX Runtime wheels install the same Python module; switching dependency groups can "
+        "leave the CPU wheel active. Recreate the GPU environment with `uv sync --no-default-groups --group "
+        "export --group cuda --group trt --group gpu-preprocess --extra torch-cuda --reinstall-package "
+        "onnxruntime-gpu`."
+    )
 
 
 class DeviceMemorySampler:
@@ -398,6 +425,7 @@ class OrtExecutor:
         preload_nvidia_libraries(tensorrt=backend == "ort-tensorrt")
         import onnxruntime as ort
 
+        _require_ort_gpu_providers(ort, backend)
         cache.mkdir(parents=True, exist_ok=True)
         providers: list[tuple[str, dict[str, Any]]] = []
         if backend == "ort-tensorrt":
@@ -987,6 +1015,17 @@ def matrix(
         "512,1024,1536,2048,2560,3072,3584,4096"
     ),
     compile_modes: Annotated[str, typer.Option(help="Comma-separated torch.compile modes.")] = "default",
+    ranker_mode: Annotated[
+        RankerMode,
+        typer.Option(help="RaCo ranker policy used for exported ONNX models; PyTorch baselines remain dense."),
+    ] = RankerMode.dense,
+    static_models: Annotated[
+        bool,
+        typer.Option(
+            "--static-models/--dynamic-models",
+            help="Export one spatially static model per size so 'auto' can select the measured shape policy.",
+        ),
+    ] = False,
     ort_cuda_fp16: Annotated[
         bool,
         typer.Option(
@@ -999,7 +1038,7 @@ def matrix(
     preprocessing: Annotated[PreprocessingBackend, typer.Option()] = "opencv",
     prefetch: Annotated[bool, typer.Option("--prefetch/--no-prefetch")] = False,
 ) -> None:
-    """Export dynamic models and run the requested benchmark matrix in isolated processes."""
+    """Export models and run the requested benchmark matrix in isolated processes."""
     selected_backends = [item for item in backends.split(",") if item]
     valid_backends = {"pytorch", "torch-compile", "ort-cuda", "ort-tensorrt", "tensorrt"}
     if not selected_backends or any(item not in valid_backends for item in selected_backends):
@@ -1015,6 +1054,13 @@ def matrix(
     valid_compile_modes = {"default", "reduce-overhead", "max-autotune-no-cudagraphs", "max-autotune"}
     if not selected_compile_modes or any(item not in valid_compile_modes for item in selected_compile_modes):
         raise typer.BadParameter(f"compile-modes must come from {sorted(valid_compile_modes)}")
+    ort_backends = [backend for backend in selected_backends if backend in {"ort-cuda", "ort-tensorrt"}]
+    if ort_backends:
+        preload_nvidia_libraries(tensorrt="ort-tensorrt" in ort_backends)
+        import onnxruntime as ort
+
+        for backend in ort_backends:
+            _require_ort_gpu_providers(ort, cast(Backend, backend))
 
     results_root.mkdir(parents=True, exist_ok=True)
     models_root.mkdir(parents=True, exist_ok=True)
@@ -1023,9 +1069,16 @@ def matrix(
     needs_ort_cuda_fp16 = ort_cuda_fp16 and "ort-cuda" in selected_backends and "fp16" in selected_precisions
 
     for num_keypoints in selected_keypoints:
-        model = models_root / f"raco-aliked-lightglue-k{num_keypoints}-dynamic.onnx"
-        fp16_model = model.with_suffix(".fp16.onnx")
-        if needs_onnx and (not model.exists() or (needs_ort_cuda_fp16 and not fp16_model.exists())):
+        model_sizes: list[int | None] = selected_sizes if static_models else [None]
+        exported_models: dict[int | None, tuple[Path, Path]] = {}
+        export_failed = False
+        for model_size in model_sizes:
+            shape_tag = f"s{model_size}" if model_size is not None else "dynamic"
+            model = models_root / f"raco-aliked-lightglue-k{num_keypoints}-{shape_tag}-{ranker_mode}.onnx"
+            fp16_model = model.with_suffix(".fp16.onnx")
+            exported_models[model_size] = (model, fp16_model)
+            if not needs_onnx or (model.exists() and (not needs_ort_cuda_fp16 or fp16_model.exists())):
+                continue
             export_command = [
                 sys.executable,
                 "-m",
@@ -1037,22 +1090,37 @@ def matrix(
                 "--batch-size",
                 "0",
                 "--height",
-                "0",
+                str(model_size or 0),
                 "--width",
-                "0",
+                str(model_size or 0),
                 "--num-keypoints",
                 str(num_keypoints),
+                "--ranker-mode",
+                str(ranker_mode),
             ]
             if needs_ort_cuda_fp16:
                 export_command.append("--fp16")
-            typer.echo(f"Exporting dynamic K={num_keypoints} model")
-            completed = _run_logged(export_command, results_root / "logs" / f"export-k{num_keypoints}.log")
+            typer.echo(f"Exporting {shape_tag} K={num_keypoints} model with ranker mode {ranker_mode}")
+            completed = _run_logged(
+                export_command,
+                results_root / "logs" / f"export-{shape_tag}-k{num_keypoints}-{ranker_mode}.log",
+            )
             if completed.returncode:
-                failure = {"stage": "export", "num_keypoints": num_keypoints, "returncode": completed.returncode}
+                failure = {
+                    "stage": "export",
+                    "size": model_size,
+                    "num_keypoints": num_keypoints,
+                    "ranker_mode": str(ranker_mode),
+                    "returncode": completed.returncode,
+                }
                 with failures_path.open("a") as stream:
                     stream.write(json.dumps(failure) + "\n")
-                typer.echo(f"Export failed for K={num_keypoints}; recorded in {failures_path}", err=True)
-                continue
+                typer.echo(
+                    f"Export failed for {shape_tag} K={num_keypoints}; recorded in {failures_path}", err=True
+                )
+                export_failed = True
+        if export_failed:
+            continue
 
         for backend in selected_backends:
             modes: list[str | None] = selected_compile_modes if backend == "torch-compile" else [None]
@@ -1071,8 +1139,9 @@ def matrix(
                     with failures_path.open("a") as stream:
                         stream.write(json.dumps(failure) + "\n")
                     continue
-                selected_model = fp16_model if backend == "ort-cuda" and precision == "fp16" else model
                 for size in selected_sizes:
+                    model, fp16_model = exported_models[size if static_models else None]
+                    selected_model = fp16_model if backend == "ort-cuda" and precision == "fp16" else model
                     for compile_mode in modes:
                         suffix = f"-{compile_mode}" if compile_mode is not None else ""
                         preprocessing_suffix = (

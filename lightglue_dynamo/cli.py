@@ -6,7 +6,7 @@ import cv2
 import typer
 
 from lightglue_dynamo.cli_utils import check_multiple_of, preload_nvidia_libraries
-from lightglue_dynamo.config import Extractor, InferenceDevice
+from lightglue_dynamo.config import Extractor, InferenceDevice, RankerMode
 
 app = typer.Typer()
 
@@ -46,11 +46,20 @@ def export(
             help="Decompose ALIKED DeformConv for TensorRT and WebGPU portability.",
         ),
     ] = True,
+    ranker_mode: Annotated[
+        RankerMode,
+        typer.Option(
+            help=(
+                "RaCo matching policy. 'auto' selects a measured export-time specialization; "
+                "standalone RaCo outputs remain densely ranked."
+            )
+        ),
+    ] = RankerMode.auto,
     bypass_ranker: Annotated[
         bool,
         typer.Option(
             "--bypass-ranker",
-            help="Skip the RaCo rotation-aware ranker and select keypoints by detector score.",
+            help="Compatibility shortcut for '--ranker-mode bypass'.",
         ),
     ] = False,
     fp16: Annotated[bool, typer.Option("--fp16", help="Whether to also convert to FP16.")] = False,
@@ -63,22 +72,33 @@ def export(
 
     from lightglue_dynamo.models import DISK, LightGlue, Pipeline, RaCoALIKED, SuperPoint
 
-    if bypass_ranker and extractor_type != Extractor.raco_aliked:
-        raise typer.BadParameter("--bypass-ranker is only supported for the raco_aliked extractor")
+    if (bypass_ranker or ranker_mode is not RankerMode.auto) and extractor_type != Extractor.raco_aliked:
+        raise typer.BadParameter("RaCo ranker options are only supported for the raco_aliked extractor")
+    if bypass_ranker and ranker_mode is not RankerMode.auto:
+        raise typer.BadParameter("--bypass-ranker cannot be combined with --ranker-mode")
+    resolved_ranker_mode = (
+        RankerMode.bypass
+        if bypass_ranker
+        else ranker_mode.resolve(num_keypoints, height or None, width or None)
+    )
 
     match extractor_type:
         case Extractor.superpoint:
             extractor = SuperPoint(num_keypoints=num_keypoints)
+            num_candidates = num_keypoints
         case Extractor.disk:
             extractor = DISK(num_keypoints=num_keypoints)
+            num_candidates = num_keypoints
         case Extractor.raco_aliked:
             if opset < 20:
                 raise typer.BadParameter("raco_aliked export requires ONNX opset 20.")
             extractor = RaCoALIKED(
                 num_keypoints=num_keypoints,
                 portable_deform_conv=portable_deform_conv,
-                bypass_ranker=bypass_ranker,
+                ranker_mode=resolved_ranker_mode,
             )
+            num_candidates = extractor.raco.num_candidates
+            typer.echo(f"RaCo matching policy: {resolved_ranker_mode}")
     matcher = LightGlue(**extractor_type.lightglue_config)
     pipeline = Pipeline(extractor, matcher).eval()
     pipeline.fuse_batch_norm()
@@ -91,8 +111,13 @@ def export(
     check_multiple_of(batch_size, 2)
     check_multiple_of(height, extractor_type.input_dim_divisor)
     check_multiple_of(width, extractor_type.input_dim_divisor)
+    if (
+        extractor_type is Extractor.raco_aliked
+        and resolved_ranker_mode in {RankerMode.candidate_local, RankerMode.boundary}
+        and ((height and height < 64) or (width and width < 64))
+    ):
+        raise typer.BadParameter("Candidate-local RaCo ranking requires height and width of at least 64")
 
-    num_candidates = extractor_type.keypoint_candidate_count(num_keypoints)
     if height > 0 and width > 0 and num_candidates > height * width:
         raise typer.BadParameter(
             f"The extractor requires {num_candidates} candidate locations, more than the {height * width} pixels."
