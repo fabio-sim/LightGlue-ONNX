@@ -102,22 +102,11 @@ CLI 会自动预加载 wheel 提供的这些库；不过，对于从 CLI 之外�
 <details>
 <summary>🔥 ONNX 导出</summary>
 <pre>
-uv run lightglue-onnx export superpoint \
+# 将 -b/-h/-w 中的任一项设为 0，即可使该维度动态化。
+uv run lightglue-onnx export raco_aliked \
   --num-keypoints 1024 \
   -b 2 -h 1024 -w 1024 \
-  -o weights/superpoint_lightglue_pipeline.onnx
-</pre>
-</details>
-
-<details>
-<summary>⚡ ONNX Runtime 推理 (CUDA)</summary>
-<pre>
-uv run lightglue-onnx infer \
-  weights/superpoint_lightglue_pipeline.onnx \
-  assets/sacre_coeur1.jpg assets/sacre_coeur2.jpg \
-  superpoint \
-  -h 1024 -w 1024 \
-  -d cuda
+  -o weights/raco_aliked_lightglue_pipeline_k1024.onnx
 </pre>
 </details>
 
@@ -135,14 +124,14 @@ uv run lightglue-onnx infer \
 </details>
 
 <details>
-<summary>🧩 TensorRT 推理</summary>
+<summary>⚡ ONNX Runtime 推理 (CUDA)</summary>
 <pre>
-uv run lightglue-onnx trtexec \
-  weights/superpoint_lightglue_pipeline.trt.onnx \
+uv run lightglue-onnx infer \
+  weights/raco_aliked_lightglue_pipeline_k1024.onnx \
   assets/sacre_coeur1.jpg assets/sacre_coeur2.jpg \
-  superpoint \
+  raco_aliked \
   -h 1024 -w 1024 \
-  --fp16
+  -d cuda
 </pre>
 </details>
 
@@ -179,9 +168,9 @@ uv run lightglue-onnx trtexec \
 <summary>🟣 ONNX Runtime 推理 (OpenVINO)</summary>
 <pre>
 uv run lightglue-onnx infer \
-  weights/superpoint_lightglue_pipeline.onnx \
+  weights/raco_aliked_lightglue_pipeline_k1024.onnx \
   assets/sacre_coeur1.jpg assets/sacre_coeur2.jpg \
-  superpoint \
+  raco_aliked \
   -h 512 -w 512 \
   -d openvino
 </pre>

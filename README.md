@@ -103,22 +103,11 @@ The CLI will preload these wheel-provided libraries automatically, however, the 
 <details>
 <summary>🔥 ONNX Export</summary>
 <pre>
-uv run lightglue-onnx export superpoint \
+# Set any of -b/-h/-w to 0 to make that dimension dynamic.
+uv run lightglue-onnx export raco_aliked \
   --num-keypoints 1024 \
   -b 2 -h 1024 -w 1024 \
-  -o weights/superpoint_lightglue_pipeline.onnx
-</pre>
-</details>
-
-<details>
-<summary>⚡ ONNX Runtime Inference (CUDA)</summary>
-<pre>
-uv run lightglue-onnx infer \
-  weights/superpoint_lightglue_pipeline.onnx \
-  assets/sacre_coeur1.jpg assets/sacre_coeur2.jpg \
-  superpoint \
-  -h 1024 -w 1024 \
-  -d cuda
+  -o weights/raco_aliked_lightglue_pipeline_k1024.onnx
 </pre>
 </details>
 
@@ -136,14 +125,14 @@ uv run lightglue-onnx infer \
 </details>
 
 <details>
-<summary>🧩 TensorRT Inference</summary>
+<summary>⚡ ONNX Runtime Inference (CUDA)</summary>
 <pre>
-uv run lightglue-onnx trtexec \
-  weights/superpoint_lightglue_pipeline.trt.onnx \
+uv run lightglue-onnx infer \
+  weights/raco_aliked_lightglue_pipeline_k1024.onnx \
   assets/sacre_coeur1.jpg assets/sacre_coeur2.jpg \
-  superpoint \
+  raco_aliked \
   -h 1024 -w 1024 \
-  --fp16
+  -d cuda
 </pre>
 </details>
 
@@ -180,9 +169,9 @@ uv run lightglue-onnx trtexec \
 <summary>🟣 ONNX Runtime Inference (OpenVINO)</summary>
 <pre>
 uv run lightglue-onnx infer \
-  weights/superpoint_lightglue_pipeline.onnx \
+  weights/raco_aliked_lightglue_pipeline_k1024.onnx \
   assets/sacre_coeur1.jpg assets/sacre_coeur2.jpg \
-  superpoint \
+  raco_aliked \
   -h 512 -w 512 \
   -d openvino
 </pre>
