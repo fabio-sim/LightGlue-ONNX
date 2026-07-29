@@ -170,6 +170,7 @@ def filter_matches(scores: torch.Tensor, threshold: float) -> tuple[torch.Tensor
 
 
 class LightGlue(nn.Module):
+    input_dim: int
     descriptor_dim: int
     num_heads: int
     n_layers: int
@@ -191,6 +192,12 @@ class LightGlue(nn.Module):
     ) -> None:
         super().__init__()
 
+        if depth_confidence != -1 and not 0 < depth_confidence < 1:
+            raise ValueError("depth_confidence must be -1 (disabled) or between 0 and 1")
+        if depth_confidence != -1 and n_layers < 2:
+            raise ValueError("adaptive depth requires at least two transformer layers")
+
+        self.input_dim = input_dim  # type: ignore[unresolved-attribute]
         self.descriptor_dim = descriptor_dim  # type: ignore[unresolved-attribute]
         self.num_heads = num_heads  # type: ignore[unresolved-attribute]
         self.n_layers = n_layers  # type: ignore[unresolved-attribute]
@@ -232,6 +239,9 @@ class LightGlue(nn.Module):
         keypoints: torch.Tensor,  # (2B, N, 2), normalized
         descriptors: torch.Tensor,  # (2B, N, D)
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.depth_confidence != -1:
+            return self._forward_adaptive_control_flow(keypoints, descriptors)
+
         descriptors = self.input_proj(descriptors)
 
         # positional embeddings
@@ -246,6 +256,103 @@ class LightGlue(nn.Module):
         matches, mscores = filter_matches(scores, self.filter_threshold)
         return matches, mscores  # (M, 3), (M,)
 
+    def _run_adaptive_layer(self, descriptors: torch.Tensor, encodings: torch.Tensor, layer_index: int) -> torch.Tensor:
+        # torch.cond currently relaxes the singleton head-broadcast axis in
+        # FakeTensor metadata. Reassert it inside every branch so rotary
+        # embedding broadcasting remains provable during ONNX export.
+        encodings = encodings.reshape(
+            2, descriptors.shape[0], 1, descriptors.shape[1], self.descriptor_dim // self.num_heads
+        )
+        return self.transformers[layer_index](descriptors, encodings)
+
+    def _should_stop(self, descriptors: torch.Tensor, layer_index: int) -> torch.Tensor:
+        confidence0, confidence1 = self.token_confidence[layer_index](descriptors[0::2], descriptors[1::2])
+        num_points = confidence0.shape[-1] + confidence1.shape[-1]
+        return self.check_if_stop(confidence0, confidence1, layer_index, num_points)
+
+    def _selected_assignment(self, descriptors: torch.Tensor, stage_index: torch.Tensor) -> torch.Tensor:
+        """Evaluate the learned assignment head for a data-dependent exit."""
+        assignments = list(self.log_assignment)
+        final_weight = torch.stack([assignment.final_proj.weight for assignment in assignments])[stage_index]
+        final_bias = torch.stack([assignment.final_proj.bias for assignment in assignments])[stage_index]
+        matchability_weight = torch.stack([assignment.matchability.weight for assignment in assignments])[stage_index]
+        matchability_bias = torch.stack([assignment.matchability.bias for assignment in assignments])[stage_index]
+
+        matched_descriptors = F.linear(descriptors, final_weight, final_bias) / assignments[0].scale
+        similarities = matched_descriptors[0::2] @ matched_descriptors[1::2].transpose(1, 2)
+        matchability = F.linear(descriptors, matchability_weight, matchability_bias)
+        return sigmoid_log_double_softmax(similarities, matchability)
+
+    def _check_adaptive_inputs(self, keypoints: torch.Tensor, descriptors: torch.Tensor) -> None:
+        if keypoints.shape[0] != 2 or descriptors.shape[0] != 2:
+            raise ValueError(
+                "adaptive depth supports exactly one image pair (two images); "
+                "different pairs cannot share one scalar exit decision"
+            )
+
+    def _forward_adaptive_control_flow(
+        self, keypoints: torch.Tensor, descriptors: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run natural learned exits as device-side control flow.
+
+        The scalar condition applies to one image pair. Sequential ``torch.cond``
+        calls are rewritten into nested ONNX ``If`` branches by the adaptive
+        exporter so a natural exit genuinely bypasses every later layer.
+        """
+        self._check_adaptive_inputs(keypoints, descriptors)
+        descriptors = self.input_proj(descriptors)
+        encodings = self.posenc(keypoints)
+        final_depth = self.n_layers
+
+        descriptors = self._run_adaptive_layer(descriptors, encodings, 0)
+        stopped = self._should_stop(descriptors, 0)
+        executed_depth = torch.where(
+            stopped,
+            torch.ones((), dtype=torch.int64, device=descriptors.device),
+            torch.full((), final_depth, dtype=torch.int64, device=descriptors.device),
+        )
+
+        for layer_index in range(1, final_depth - 1):
+
+            def run_next(
+                current_descriptors: torch.Tensor,
+                current_encodings: torch.Tensor,
+                current_layer_index: int = layer_index,
+            ) -> tuple[torch.Tensor, torch.Tensor]:
+                current_descriptors = self._run_adaptive_layer(
+                    current_descriptors, current_encodings, current_layer_index
+                )
+                return current_descriptors, self._should_stop(current_descriptors, current_layer_index)
+
+            def skip_next(
+                current_descriptors: torch.Tensor, current_encodings: torch.Tensor
+            ) -> tuple[torch.Tensor, torch.Tensor]:
+                del current_encodings
+                return (
+                    current_descriptors.clone(),
+                    torch.ones((), dtype=torch.bool, device=current_descriptors.device),
+                )
+
+            was_stopped = stopped
+            descriptors, stopped_at_current = torch.cond(~was_stopped, run_next, skip_next, (descriptors, encodings))
+            executed_depth = torch.where(
+                ~was_stopped & stopped_at_current,
+                torch.full((), layer_index + 1, dtype=torch.int64, device=descriptors.device),
+                executed_depth,
+            )
+            stopped = was_stopped | stopped_at_current
+
+        def run_final(current_descriptors: torch.Tensor, current_encodings: torch.Tensor) -> torch.Tensor:
+            return self._run_adaptive_layer(current_descriptors, current_encodings, final_depth - 1)
+
+        def skip_final(current_descriptors: torch.Tensor, current_encodings: torch.Tensor) -> torch.Tensor:
+            del current_encodings
+            return current_descriptors.clone()
+
+        descriptors = torch.cond(~stopped, run_final, skip_final, (descriptors, encodings))
+        scores = self._selected_assignment(descriptors, executed_depth - 1)
+        return filter_matches(scores, self.filter_threshold)
+
     @torch.inference_mode()
     def forward_adaptive_depth(
         self, keypoints: torch.Tensor, descriptors: torch.Tensor
@@ -253,11 +360,12 @@ class LightGlue(nn.Module):
         """Run host-orchestrated early stopping and report the executed layer count.
 
         The scalar stop decision is copied to the host after each stage. This is
-        genuinely work-reducing in eager PyTorch, but it is intentionally kept out
-        of ``forward`` because ONNX and TensorRT exports remain fixed-depth graphs.
+        a lightweight eager alternative to the device-side control flow used by
+        ``forward`` and the adaptive ONNX exporter.
         """
-        if not 0 < self.depth_confidence < 1:
+        if self.depth_confidence == -1:
             raise ValueError("adaptive depth requires depth_confidence between 0 and 1")
+        self._check_adaptive_inputs(keypoints, descriptors)
         descriptors = self.input_proj(descriptors)
         encodings = self.posenc(keypoints)
         executed_layers = self.n_layers

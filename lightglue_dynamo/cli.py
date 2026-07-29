@@ -1,4 +1,4 @@
-from math import ceil, sqrt
+from math import ceil, isfinite, sqrt
 from pathlib import Path
 from typing import Annotated, Literal, cast
 
@@ -62,6 +62,15 @@ def export(
             help="Compatibility shortcut for '--ranker-mode bypass'.",
         ),
     ] = False,
+    depth_confidence: Annotated[
+        float,
+        typer.Option(
+            help=(
+                "LightGlue adaptive-depth threshold. Use a value strictly between 0 and 1 to enable; "
+                "-1 keeps the fixed-depth graph."
+            )
+        ),
+    ] = -1.0,
     fp16: Annotated[bool, typer.Option("--fp16", help="Whether to also convert to FP16.")] = False,
 ) -> None:
     """Export LightGlue to ONNX."""
@@ -71,6 +80,27 @@ def export(
     from onnxscript import opset20 as onnx_op
 
     from lightglue_dynamo.models import DISK, LightGlue, Pipeline, RaCoALIKED, SuperPoint
+
+    if not isfinite(depth_confidence) or (depth_confidence != -1 and not 0 < depth_confidence < 1):
+        raise typer.BadParameter(
+            "--depth-confidence must be -1 (disabled) or strictly between 0 and 1", param_hint="--depth-confidence"
+        )
+    adaptive_depth = depth_confidence != -1
+    if adaptive_depth:
+        if opset != 20:
+            raise typer.BadParameter("Adaptive-depth export requires --opset 20", param_hint="--opset")
+        if fp16:
+            raise typer.BadParameter(
+                "Adaptive-depth ONNX must remain FP32; use 'infer --fp16' to let TensorRT select FP16",
+                param_hint="--fp16",
+            )
+        if batch_size == 0:
+            batch_size = 2
+            typer.echo("Adaptive depth uses a fixed batch of one image pair (-b 2).")
+        elif batch_size != 2:
+            raise typer.BadParameter(
+                "Adaptive depth supports exactly one image pair; use --batch-size 2", param_hint="--batch-size"
+            )
 
     if (bypass_ranker or ranker_mode is not RankerMode.auto) and extractor_type != Extractor.raco_aliked:
         raise typer.BadParameter("RaCo ranker options are only supported for the raco_aliked extractor")
@@ -99,12 +129,13 @@ def export(
             )
             num_candidates = extractor.raco.num_candidates
             typer.echo(f"RaCo matching policy: {resolved_ranker_mode}")
-    matcher = LightGlue(**extractor_type.lightglue_config)
+    matcher = LightGlue(**extractor_type.lightglue_config, depth_confidence=depth_confidence)
     pipeline = Pipeline(extractor, matcher).eval()
     pipeline.fuse_batch_norm()
 
     if output is None:
-        output = Path(f"weights/{extractor_type}_lightglue_pipeline.onnx")
+        suffix = "_adaptive" if adaptive_depth else ""
+        output = Path(f"weights/{extractor_type}_lightglue_pipeline{suffix}.onnx")
 
     output_names = ["keypoints", "matches", "mscores"]
 
@@ -162,19 +193,34 @@ def export(
         else:
             example_width = width or dynamic_side
         inputs = (torch.zeros(example_batch, extractor_type.input_channels, example_height, example_width),)
-        torch.onnx.export(
-            pipeline,
-            inputs,
-            str(output),
-            input_names=["images"],
-            output_names=output_names,
-            opset_version=opset,
-            dynamic_shapes=build_dynamic_shapes(),
-            dynamo=True,
-            external_data=False,
-            optimize=False,
-            custom_translation_table={torch.ops.aten.div.Tensor_mode: translate_integer_div},
-        )
+        dynamic_shapes = build_dynamic_shapes()
+        translation_table = {torch.ops.aten.div.Tensor_mode: translate_integer_div}
+        if adaptive_depth:
+            from lightglue_dynamo.adaptive_depth import export_adaptive_pipeline
+
+            export_adaptive_pipeline(
+                pipeline=pipeline,
+                example_images=inputs[0],
+                num_keypoints=num_keypoints,
+                output=output,
+                opset=opset,
+                dynamic_shapes=dynamic_shapes,
+                custom_translation_table=translation_table,
+            )
+        else:
+            torch.onnx.export(
+                pipeline,
+                inputs,
+                str(output),
+                input_names=["images"],
+                output_names=output_names,
+                opset_version=opset,
+                dynamic_shapes=dynamic_shapes,
+                dynamo=True,
+                external_data=False,
+                optimize=False,
+                custom_translation_table=translation_table,
+            )
 
     export_model()
     onnx.checker.check_model(output)
@@ -240,6 +286,7 @@ def infer(
     import onnxruntime as ort
 
     from lightglue_dynamo import viz
+    from lightglue_dynamo.adaptive_depth import CONTROL_FLOW_DISABLED_OPTIMIZERS, is_adaptive_depth_model
     from lightglue_dynamo.preprocessors import (
         CudaPreparedImages,
         CudaRaCoPreprocessor,
@@ -314,15 +361,25 @@ def infer(
         typer.echo("Warning: Requested providers unavailable. Falling back to CPUExecutionProvider.")
         selected = [("CPUExecutionProvider", {})]
 
+    session_kwargs: dict[str, object] = {}
+    if is_adaptive_depth_model(model_path):
+        # These are the only two ORT 1.27 passes known to generate duplicate
+        # lexical names across nested If branches. All other optimizations,
+        # including TensorRT engine optimization, remain enabled.
+        session_kwargs["disabled_optimizers"] = set(CONTROL_FLOW_DISABLED_OPTIMIZERS)
+
+    def create_session(session_providers: list[tuple[str, dict[str, object]]]) -> ort.InferenceSession:
+        return ort.InferenceSession(model_path, session_options, session_providers, **session_kwargs)
+
     try:
-        session = ort.InferenceSession(model_path, session_options, selected)
+        session = create_session(selected)
     except Exception as exc:
         if device == InferenceDevice.cuda:
             typer.echo(f"Warning: CUDA provider failed ({exc}). Falling back to CPUExecutionProvider.")
-            session = ort.InferenceSession(model_path, session_options, [("CPUExecutionProvider", {})])
+            session = create_session([("CPUExecutionProvider", {})])
         elif device == InferenceDevice.tensorrt:
             typer.echo(f"Warning: TensorRT provider failed ({exc}). Falling back to CUDAExecutionProvider.")
-            session = ort.InferenceSession(model_path, session_options, [("CUDAExecutionProvider", {})])
+            session = create_session([("CUDAExecutionProvider", {})])
         else:
             raise
 
@@ -343,9 +400,14 @@ def infer(
         input_shape = session.get_inputs()[0].shape
         prepared_shape = images.shape
         if len(input_shape) == 4:
+            batch_dim = input_shape[0]
             channel_dim = input_shape[1]
             height_dim = input_shape[2]
             width_dim = input_shape[3]
+            if isinstance(batch_dim, int) and batch_dim != prepared_shape[0]:
+                raise typer.BadParameter(
+                    f"Model expects a batch of {batch_dim} images but preprocessing produced {prepared_shape[0]}."
+                )
             if isinstance(channel_dim, int) and channel_dim != prepared_shape[1]:
                 raise typer.BadParameter(
                     f"Model expects {channel_dim} channels but got {prepared_shape[1]} from preprocessing."
@@ -369,7 +431,7 @@ def infer(
                 outputs = cast(list[np.ndarray], binding.copy_outputs_to_cpu())
                 if profile:
                     last_inference_time = time.perf_counter() - start
-                keypoints, matches, _mscores = outputs
+                keypoints, matches, _mscores = outputs[:3]
         else:
             for _ in range(100 if profile else 1):
                 if profile:
@@ -377,7 +439,7 @@ def infer(
                 outputs = cast(list[np.ndarray], session.run(None, {"images": images}))
                 if profile:
                     last_inference_time = time.perf_counter() - start
-                keypoints, matches, _mscores = outputs
+                keypoints, matches, _mscores = outputs[:3]
 
         match_count = int(matches.shape[0])
         typer.echo(f"Matches: {match_count}")
