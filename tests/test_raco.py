@@ -392,9 +392,29 @@ def test_adaptive_depth_skips_unneeded_layers(monkeypatch: pytest.MonkeyPatch) -
     ]
     keypoints = torch.rand(2, 8, 2) * 2 - 1
     descriptors = torch.rand(2, 8, 256)
-    _matches, _scores, executed = matcher.forward_adaptive_depth(keypoints, descriptors)
+    expected_matches, expected_scores, executed = matcher.forward_adaptive_depth(keypoints, descriptors)
     for hook in hooks:
         hook.remove()
+    with torch.inference_mode():
+        actual_matches, actual_scores = matcher(keypoints, descriptors)
 
     assert executed == 1
     assert calls == [1, 0, 0]
+    torch.testing.assert_close(actual_matches, expected_matches)
+    torch.testing.assert_close(actual_scores, expected_scores)
+
+
+def test_adaptive_depth_rejects_multiple_pairs(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(torch.hub, "load_state_dict_from_url", lambda *args, **kwargs: {})
+    matcher = LightGlue(url="https://example.invalid/weights.pth", n_layers=2, depth_confidence=0.95).eval()
+
+    with pytest.raises(ValueError, match="exactly one image pair"):
+        matcher(torch.rand(4, 8, 2), torch.rand(4, 8, 256))
+
+
+@pytest.mark.parametrize("depth_confidence", [-2, -0.5, 0, 1, 1.1])
+def test_lightglue_rejects_invalid_depth_confidence(monkeypatch: pytest.MonkeyPatch, depth_confidence: float) -> None:
+    monkeypatch.setattr(torch.hub, "load_state_dict_from_url", lambda *args, **kwargs: {})
+
+    with pytest.raises(ValueError, match="must be -1"):
+        LightGlue(url="https://example.invalid/weights.pth", n_layers=2, depth_confidence=depth_confidence)
