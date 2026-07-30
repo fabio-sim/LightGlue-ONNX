@@ -45,9 +45,9 @@ class DeformableConv2d(nn.Module):
     def _portable_deform_conv2d(self, tensor: torch.Tensor, offsets: torch.Tensor) -> torch.Tensor:
         """Decompose the 3x3 deformable convolution into standard GridSample operations.
 
-        TensorRT requires a separately distributed plugin for the standard ONNX
-        DeformConv node. This path is slower in eager PyTorch, but exports without
-        custom operators and keeps the normal torchvision implementation available.
+        This path avoids relying on backend-specific DeformConv support and remains
+        usable by WebGPU. The normal torchvision implementation exports the standard
+        ONNX operator and can use TensorRT's native plugin when it is available.
         """
         _batch, _channels, height, width = tensor.shape
         dtype = tensor.dtype

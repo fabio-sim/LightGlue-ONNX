@@ -43,7 +43,7 @@ def export(
         bool,
         typer.Option(
             "--portable-deform-conv/--onnx-deform-conv",
-            help="Decompose ALIKED DeformConv for TensorRT and WebGPU portability.",
+            help="Decompose ALIKED DeformConv into GridSample operations for broad runtime and WebGPU support.",
         ),
     ] = True,
     ranker_mode: Annotated[

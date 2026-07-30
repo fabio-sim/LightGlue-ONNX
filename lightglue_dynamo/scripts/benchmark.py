@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
@@ -622,6 +622,14 @@ def _percentiles(values: list[float]) -> dict[str, float] | None:
     }
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _summarize(records: list[dict[str, Any]], configuration: dict[str, Any]) -> dict[str, Any]:
     numeric_fields = [
         "preprocessing_ms",
@@ -692,6 +700,144 @@ def _completed_records(path: Path, configuration: dict[str, Any]) -> tuple[list[
     if records and (not meta_path.exists() or json.loads(meta_path.read_text())["configuration"] != configuration):
         raise typer.BadParameter(f"Existing result configuration does not match: {path}")
     return records, {int(record["pair_index"]) for record in records}
+
+
+def _load_indexed_records(path: Path) -> dict[int, dict[str, Any]]:
+    records: dict[int, dict[str, Any]] = {}
+    for line_number, line in enumerate(path.read_text().splitlines(), start=1):
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        if "pair_index" not in record:
+            raise typer.BadParameter(f"Missing pair_index in {path}:{line_number}")
+        pair_index = int(record["pair_index"])
+        if pair_index in records:
+            raise typer.BadParameter(f"Duplicate pair_index={pair_index} in {path}")
+        records[pair_index] = record
+    if not records:
+        raise typer.BadParameter(f"No benchmark records found in {path}")
+    return records
+
+
+def _bootstrap_paired(
+    reference: np.ndarray,
+    candidate: np.ndarray,
+    statistic: Callable[[np.ndarray, np.ndarray], float],
+    *,
+    samples: int,
+    seed: int,
+) -> tuple[float, list[float]]:
+    estimate = float(statistic(reference, candidate))
+    if samples == 0:
+        return estimate, []
+    rng = np.random.default_rng(seed)
+    bootstrapped = np.empty(samples, dtype=np.float64)
+    batch_size = max(1, min(samples, 256))
+    for start in range(0, samples, batch_size):
+        stop = min(start + batch_size, samples)
+        indices = rng.integers(0, len(reference), size=(stop - start, len(reference)))
+        for offset, selected in enumerate(indices):
+            bootstrapped[start + offset] = statistic(reference[selected], candidate[selected])
+    return estimate, [float(np.percentile(bootstrapped, 2.5)), float(np.percentile(bootstrapped, 97.5))]
+
+
+def _correct_match_counts(records: list[dict[str, Any]], threshold: int) -> tuple[np.ndarray, np.ndarray]:
+    counts = np.asarray([record["match_count"] for record in records], dtype=np.float64)
+    precision_field = f"epipolar_precision_{threshold}px"
+    correct = np.empty_like(counts)
+    for index, (record, count) in enumerate(zip(records, counts, strict=True)):
+        precision = record.get(precision_field)
+        if count == 0:
+            correct[index] = 0
+        elif precision is None:
+            raise typer.BadParameter(
+                f"pair_index={record['pair_index']} has {count:g} matches but no {precision_field}"
+            )
+        else:
+            correct[index] = count * float(precision)
+    return counts, correct
+
+
+def _compare_records(
+    reference: list[dict[str, Any]], candidate: list[dict[str, Any]], *, bootstrap_samples: int, bootstrap_seed: int
+) -> dict[str, Any]:
+    reference_latency = np.asarray([record["inference_wall_ms"] for record in reference], dtype=np.float64)
+    candidate_latency = np.asarray([record["inference_wall_ms"] for record in candidate], dtype=np.float64)
+    reference_counts = np.asarray([record["match_count"] for record in reference], dtype=np.float64)
+    candidate_counts = np.asarray([record["match_count"] for record in candidate], dtype=np.float64)
+
+    def paired_metric(
+        reference_values: np.ndarray,
+        candidate_values: np.ndarray,
+        statistic: Callable[[np.ndarray, np.ndarray], float],
+        seed_offset: int,
+    ) -> dict[str, Any]:
+        estimate, interval = _bootstrap_paired(
+            reference_values, candidate_values, statistic, samples=bootstrap_samples, seed=bootstrap_seed + seed_offset
+        )
+        return {"estimate": estimate, "bootstrap_95_percent_interval": interval or None}
+
+    comparison: dict[str, Any] = {
+        "pairs": len(reference),
+        "reference": {
+            "inference_wall_ms": _percentiles(reference_latency.tolist()),
+            "match_count": _percentiles(reference_counts.tolist()),
+            "zero_match_pairs": int(np.sum(reference_counts == 0)),
+            "at_most_five_match_pairs": int(np.sum(reference_counts <= 5)),
+        },
+        "candidate": {
+            "inference_wall_ms": _percentiles(candidate_latency.tolist()),
+            "match_count": _percentiles(candidate_counts.tolist()),
+            "zero_match_pairs": int(np.sum(candidate_counts == 0)),
+            "at_most_five_match_pairs": int(np.sum(candidate_counts <= 5)),
+        },
+        "paired_deltas": {
+            "median_latency_ratio": paired_metric(
+                reference_latency, candidate_latency, lambda ref, cand: np.median(cand / ref), 0
+            ),
+            "mean_match_count": paired_metric(
+                reference_counts, candidate_counts, lambda ref, cand: np.mean(cand - ref), 1
+            ),
+            "zero_match_rate": paired_metric(
+                reference_counts, candidate_counts, lambda ref, cand: np.mean(cand == 0) - np.mean(ref == 0), 2
+            ),
+            "at_most_five_match_rate": paired_metric(
+                reference_counts, candidate_counts, lambda ref, cand: np.mean(cand <= 5) - np.mean(ref <= 5), 3
+            ),
+        },
+        "geometry": {},
+    }
+    for threshold in (1, 3, 5):
+        reference_threshold_counts, reference_correct = _correct_match_counts(reference, threshold)
+        candidate_threshold_counts, candidate_correct = _correct_match_counts(candidate, threshold)
+        reference_total = float(reference_threshold_counts.sum())
+        candidate_total = float(candidate_threshold_counts.sum())
+        comparison["geometry"][f"{threshold}px"] = {
+            "reference": {
+                "matches": int(reference_total),
+                "correct_matches": float(reference_correct.sum()),
+                "weighted_precision": float(reference_correct.sum() / reference_total),
+                "correct_yield_per_pair": float(reference_correct.mean()),
+            },
+            "candidate": {
+                "matches": int(candidate_total),
+                "correct_matches": float(candidate_correct.sum()),
+                "weighted_precision": float(candidate_correct.sum() / candidate_total),
+                "correct_yield_per_pair": float(candidate_correct.mean()),
+            },
+            "paired_deltas": {
+                "weighted_precision": paired_metric(
+                    np.column_stack((reference_threshold_counts, reference_correct)),
+                    np.column_stack((candidate_threshold_counts, candidate_correct)),
+                    lambda ref, cand: cand[:, 1].sum() / cand[:, 0].sum() - ref[:, 1].sum() / ref[:, 0].sum(),
+                    10 + threshold,
+                ),
+                "correct_yield_per_pair": paired_metric(
+                    reference_correct, candidate_correct, lambda ref, cand: np.mean(cand - ref), 20 + threshold
+                ),
+            },
+        }
+    return comparison
 
 
 def _create_executor(
@@ -796,6 +942,7 @@ def run(
     configuration = {
         "backend": backend,
         "model": str(model.resolve()) if model is not None else None,
+        "model_sha256": _file_sha256(model) if model is not None else None,
         "size": size,
         "num_keypoints": num_keypoints,
         "precision": precision,
@@ -981,6 +1128,61 @@ def run(
     summary_path.write_text(json.dumps(summary, indent=2) + "\n")
     typer.echo(json.dumps(summary, indent=2))
     typer.echo(f"Wrote {output} and {summary_path}")
+
+
+@app.command("compare")
+def compare_results(
+    reference: Annotated[Path, typer.Option(exists=True, dir_okay=False, readable=True)],
+    candidate: Annotated[Path, typer.Option(exists=True, dir_okay=False, readable=True)],
+    output: Annotated[Path | None, typer.Option(dir_okay=False)] = None,
+    bootstrap_samples: Annotated[int, typer.Option(min=0)] = 2000,
+    bootstrap_seed: Annotated[int, typer.Option(min=0)] = 0,
+) -> None:
+    """Compare two paired benchmark JSONL files with geometric quality gates."""
+    reference_by_index = _load_indexed_records(reference)
+    candidate_by_index = _load_indexed_records(candidate)
+    reference_indices = set(reference_by_index)
+    candidate_indices = set(candidate_by_index)
+    if reference_indices != candidate_indices:
+        missing_candidate = sorted(reference_indices - candidate_indices)
+        missing_reference = sorted(candidate_indices - reference_indices)
+        raise typer.BadParameter(
+            "Benchmark pair sets differ. "
+            f"Missing from candidate: {missing_candidate[:10]}; "
+            f"missing from reference: {missing_reference[:10]}"
+        )
+    pair_indices = sorted(reference_indices)
+    comparison = _compare_records(
+        [reference_by_index[index] for index in pair_indices],
+        [candidate_by_index[index] for index in pair_indices],
+        bootstrap_samples=bootstrap_samples,
+        bootstrap_seed=bootstrap_seed,
+    )
+
+    def metadata(path: Path) -> dict[str, Any] | None:
+        meta_path = path.with_suffix(path.suffix + ".meta.json")
+        return json.loads(meta_path.read_text()) if meta_path.exists() else None
+
+    result = {
+        "reference": {
+            "path": str(reference.resolve()),
+            "sha256": _file_sha256(reference),
+            "metadata": metadata(reference),
+        },
+        "candidate": {
+            "path": str(candidate.resolve()),
+            "sha256": _file_sha256(candidate),
+            "metadata": metadata(candidate),
+        },
+        "bootstrap": {"samples": bootstrap_samples, "seed": bootstrap_seed},
+        "comparison": comparison,
+    }
+    if output is None:
+        output = candidate.with_suffix(candidate.suffix + ".comparison.json")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(result, indent=2) + "\n")
+    typer.echo(json.dumps(result, indent=2))
+    typer.echo(f"Wrote {output}")
 
 
 def _parse_csv_ints(value: str, name: str) -> list[int]:
